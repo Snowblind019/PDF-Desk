@@ -1,0 +1,10 @@
+# PDF Desk runtime dependencies. Everything runs offline once installed.
+PyMuPDF>=1.25.0
+pymupdf-fonts>=1.0.5
+PySide6-Essentials>=6.6
+pdf2docx>=0.5.8
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=0.6.23
+Markdown>=3.5
+Pillow>=10.0
