@@ -135,3 +135,20 @@ def safe_filename_part(text: str, limit: int = 100) -> str:
     text = re.sub(r'[\\/:*?"<>|]+', "_", text)
     text = re.sub(r"\s+", " ", text).strip(" .")
     return text[:limit].rstrip(" .")
+
+
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r", "\uff1d", "\uff0b", "\uff0d", "\uff20")
+
+
+def csv_cell(value) -> str:
+    """A spreadsheet cell that is always shown as text: cells starting with = + - @ would otherwise
+    be run as formulas (which can open web pages or leak data) when the CSV is opened."""
+    text = "" if value is None else str(value)
+    return ("'" + text) if text.startswith(_FORMULA_START) else text
+
+
+def csv_uncell(text: str) -> str:
+    """Undo csv_cell when reading back a CSV PDF Desk wrote."""
+    if text.startswith("'") and text[1:].startswith(_FORMULA_START):
+        return text[1:]
+    return text

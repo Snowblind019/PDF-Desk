@@ -27,13 +27,18 @@ class ColorButton(QToolButton):
     """A button showing the current color with a quick palette and a full color picker."""
     color_changed = Signal(str)
 
-    def __init__(self, color: str = "#e5383b", tooltip: str = "Color", parent=None):
+    def __init__(self, color: str = "#e5383b", tooltip: str = "Color", parent=None, glyph: str | None = None,
+                 none_label: str | None = None):
         super().__init__(parent)
         self._color = color
+        self._glyph = glyph
         self.setToolTip(tooltip)
         self.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.setIconSize(QSize(18, 18))
         menu = QMenu(self)
+        if none_label:
+            menu.addAction(none_label, lambda: self.set_color("", emit=True))
+            menu.addSeparator()
         grid_host = QWidget()
         grid = QGridLayout(grid_host)
         grid.setContentsMargins(8, 8, 8, 4)
@@ -64,10 +69,26 @@ class ColorButton(QToolButton):
             self.color_changed.emit(color)
 
     def _refresh(self) -> None:
-        self.setIcon(swatch_icon(self._color, 18))
+        if not self._glyph:
+            self.setIcon(swatch_icon(self._color or "#ffffff", 18))
+            return
+        from pdfdesk import icons
+        size = 18
+        pm = QPixmap(size * 2, size * 2)
+        pm.setDevicePixelRatio(2)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.drawPixmap(1, 0, icons.icon(self._glyph).pixmap(size - 3, size - 3))
+        if self._color:
+            p.fillRect(1, size - 4, size - 2, 4, QColor(self._color))
+        else:
+            p.setPen(QColor(0, 0, 0, 110))
+            p.drawRect(1, size - 4, size - 3, 3)
+        p.end()
+        self.setIcon(QIcon(pm))
 
     def _pick(self) -> None:
-        c = QColorDialog.getColor(QColor(self._color), self, "Choose a color")
+        c = QColorDialog.getColor(QColor(self._color or "#ffff00"), self, "Choose a color")
         if c.isValid():
             self.set_color(c.name(), emit=True)
 

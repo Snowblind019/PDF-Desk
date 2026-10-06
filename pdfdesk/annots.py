@@ -8,7 +8,7 @@ import re
 
 import pymupdf as fitz
 
-from pdfdesk import fonts
+from pdfdesk import appearance, fonts, richtext
 
 MARKUP_TYPES = {fitz.PDF_ANNOT_HIGHLIGHT, fitz.PDF_ANNOT_UNDERLINE, fitz.PDF_ANNOT_STRIKE_OUT,
                 fitz.PDF_ANNOT_SQUIGGLY}
@@ -44,7 +44,17 @@ def now_pdf_date() -> str:
     return fitz.get_pdf_now()
 
 
+KIND_NAMES = {"RichText": "Text box", "Image": "Image", "Signature": "Signature", "Check": "Check mark",
+              "Cross": "Cross mark", "Dot": "Dot", "Measure": "Measurement", "DigitalSignature": "Digital signature"}
+
+
 def type_name(annot) -> str:
+    try:
+        kind = appearance.kind_of(annot.parent.parent, annot.xref)
+    except Exception:
+        kind = ""
+    if kind in KIND_NAMES:
+        return KIND_NAMES[kind]
     if annot.type[0] == fitz.PDF_ANNOT_FREE_TEXT and (annot.info or {}).get("subject") == "Stamp":
         return "Stamp"
     return TYPE_NAMES.get(annot.type[0], annot.type[1])
@@ -101,6 +111,7 @@ def add_textbox(page: fitz.Page, rect: fitz.Rect, text: str, fontsize: float, co
     # Plain FreeText boxes draw their border in the text color (border_color only works for rich text).
     annot = page.add_freetext_annot(rect, text, fontsize=fontsize, fontname="Helv", text_color=color,
                                     fill_color=fill, border_width=border_width, rotate=page.rotation, align=align)
+    page.parent.xref_set_key(annot.xref, "CL", "null")  # PyMuPDF adds an empty callout some viewers draw
     return _finish(annot, author)
 
 
@@ -109,6 +120,7 @@ def freetext_style(doc: fitz.Document, annot) -> tuple[float, tuple]:
     size, color = 12.0, (0, 0, 0)
     try:
         kind, da = doc.xref_get_key(annot.xref, "DA")
+        da = da[:300]  # from the PDF: keep it short so the patterns below stay fast
         if kind == "string":
             m = re.search(r"([\d.]+)\s+Tf", da)
             if m:
@@ -182,6 +194,7 @@ def add_stamp(page: fitz.Page, rect: fitz.Rect, name: str, author: str = ""):
     rect = fitz.Rect(rect.x0, cy - h / 2, rect.x1, cy + h / 2)
     annot = page.add_freetext_annot(rect, text, fontsize=size, fontname="Helv", text_color=(0.75, 0.1, 0.12),
                                     border_width=2, align=1, rotate=page.rotation)
+    page.parent.xref_set_key(annot.xref, "CL", "null")
     return _finish(annot, author, subject="Stamp")
 
 
@@ -189,6 +202,70 @@ def add_image(page: fitz.Page, rect: fitz.Rect, data: bytes) -> None:
     """Place an image (or signature) on the page as page content."""
     fonts.ensure_wrapped(page)
     page.insert_image(rect, stream=data, keep_proportion=True, rotate=page.rotation)
+
+
+def add_image_annot(page: fitz.Page, rect: fitz.Rect, data: bytes, kind: str = "Image", author: str = "") -> int:
+    """Place an image or signature as an item that can still be moved, resized or deleted
+    (it becomes part of the page when flattened). rect is in unrotated page coordinates."""
+    doc = page.parent
+    vis = (fitz.Rect(rect) * page.rotation_matrix).normalize()
+    label = {"Signature": "Signature", "Initials": "Initials"}.get(kind, "Image")
+    xref = appearance.new_annot(page, "Stamp", rect, kind, author, contents=label)
+    tmp = fitz.open()
+    tp = tmp.new_page(width=max(1.0, vis.width), height=max(1.0, vis.height))
+    tp.insert_image(tp.rect, stream=data, keep_proportion=True)
+    appearance.apply(doc, xref, tmp, page.rotation)
+    return xref
+
+
+MARK_KINDS = ("Check", "Cross", "Dot")
+
+
+def _mark_page(kind: str, w: float, h: float, color) -> fitz.Document:
+    tmp = fitz.open()
+    tp = tmp.new_page(width=max(1.0, w), height=max(1.0, h))
+    side = min(w, h)
+    width = max(0.8, side * 0.13)
+    shape = tp.new_shape()
+    if kind == "Check":
+        shape.draw_polyline([fitz.Point(w * 0.12, h * 0.55), fitz.Point(w * 0.4, h * 0.83), fitz.Point(w * 0.9, h * 0.15)])
+        shape.finish(color=color, width=width, lineCap=1, lineJoin=1, closePath=False)
+    elif kind == "Cross":
+        shape.draw_line(fitz.Point(w * 0.15, h * 0.15), fitz.Point(w * 0.85, h * 0.85))
+        shape.draw_line(fitz.Point(w * 0.85, h * 0.15), fitz.Point(w * 0.15, h * 0.85))
+        shape.finish(color=color, width=width, lineCap=1)
+    else:
+        shape.draw_circle(fitz.Point(w / 2, h / 2), side * 0.3)
+        shape.finish(color=None, fill=color)
+    shape.commit()
+    return tmp
+
+
+def add_mark(page: fitz.Page, rect: fitz.Rect, kind: str, color, author: str = "") -> int:
+    """A check mark, cross or dot for filling in forms that have no form fields (Fill & Sign)."""
+    doc = page.parent
+    vis = (fitz.Rect(rect) * page.rotation_matrix).normalize()
+    xref = appearance.new_annot(page, "Stamp", rect, kind, author, contents=kind)
+    appearance.apply(doc, xref, _mark_page(kind, vis.width, vis.height, color), page.rotation)
+    _set_mark_color(doc, xref, color)
+    return xref
+
+
+def _set_mark_color(doc, xref, color) -> None:
+    r, g, b = fonts.to_rgb(color)
+    doc.xref_set_key(xref, "C", f"[{r:.3f} {g:.3f} {b:.3f}]")
+
+
+def recolor_mark(page: fitz.Page, xref: int, color) -> None:
+    doc = page.parent
+    kind = appearance.kind_of(doc, xref)
+    annot = page.load_annot(xref)
+    vis = (annot.rect * page.rotation_matrix).normalize()
+    op = appearance.opacity_of(doc, xref)
+    appearance.apply(doc, xref, _mark_page(kind, vis.width, vis.height, color), page.rotation)
+    _set_mark_color(doc, xref, color)
+    if op < 1:
+        appearance.set_opacity(page, xref, op)
 
 
 def add_redaction(page: fitz.Page, rect: fitz.Rect, author: str = ""):
@@ -250,6 +327,11 @@ def can_move(annot) -> bool:
 
 def can_resize(annot) -> bool:
     t = annot.type[0]
+    try:
+        if appearance.kind_of(annot.parent.parent, annot.xref) == "Measure":
+            return False  # a measurement would no longer match its number
+    except Exception:
+        pass
     return can_move(annot) and t not in FIXED_SIZE_TYPES
 
 
@@ -279,6 +361,25 @@ def transform_annot(page: fitz.Page, annot, new_rect: fitz.Rect):
     """Move/resize an annotation so its rectangle becomes new_rect. Returns the (possibly new) annotation."""
     t = annot.type[0]
     old = annot.rect
+    doc = page.parent
+    kind = appearance.kind_of(doc, annot.xref)
+    if kind:
+        # PDF Desk drew this one itself: never let the engine redraw it.
+        xref = annot.xref
+        resized = abs(new_rect.width - old.width) > 0.5 or abs(new_rect.height - old.height) > 0.5
+        if kind == richtext.KIND and resized:
+            box = richtext.read_box(doc, xref)
+            if box is not None:
+                vis = (fitz.Rect(new_rect) * page.rotation_matrix).normalize()
+                box.auto_width = False
+                box.min_height = vis.height
+                richtext.update(page, xref, box, vis_rect=vis, keep_height=True)
+                return page.load_annot(xref)
+        if resized and appearance.keeps_aspect(doc, xref) and old.width > 0 and old.height > 0:
+            ratio = old.height / old.width
+            new_rect = fitz.Rect(new_rect.x0, new_rect.y0, new_rect.x1, new_rect.y0 + new_rect.width * ratio)
+        appearance.move_annot(page, xref, new_rect)
+        return page.load_annot(xref)
     if t in POINT_TYPES:
         sx = new_rect.width / old.width if old.width else 1
         sy = new_rect.height / old.height if old.height else 1
@@ -310,8 +411,31 @@ def transform_annot(page: fitz.Page, annot, new_rect: fitz.Rect):
     return annot
 
 
-def restyle(doc: fitz.Document, annot, color=None, width: float | None = None, opacity: float | None = None) -> None:
+_KEEP = object()
+
+
+def restyle(doc: fitz.Document, annot, color=None, width: float | None = None, opacity: float | None = None,
+            fill=_KEEP, page: fitz.Page | None = None) -> None:
     t = annot.type[0]
+    kind = appearance.kind_of(doc, annot.xref)
+    if kind == richtext.KIND and page is not None:
+        box = richtext.read_box(doc, annot.xref)
+        if box is None:
+            return
+        if color is not None:
+            box.set_all(color=fonts.rgb_to_hex(color))
+        if opacity is not None:
+            box.opacity = max(0.05, min(1.0, float(opacity)))
+        if fill is not _KEEP:
+            box.fill = fonts.rgb_to_hex(fill) if fill else None
+        richtext.update(page, annot.xref, box)
+        return
+    if kind:
+        if color is not None and kind in MARK_KINDS and page is not None:
+            recolor_mark(page, annot.xref, color)
+        if opacity is not None and page is not None:
+            appearance.set_opacity(page, annot.xref, opacity)
+        return
     if t == fitz.PDF_ANNOT_FREE_TEXT:
         size, old_color = freetext_style(doc, annot)
         annot.update(fontsize=size, text_color=color if color is not None else old_color)
@@ -349,10 +473,31 @@ def widget_at(page: fitz.Page, pt: fitz.Point):
     return None
 
 
+def _raw_value(kind: str, value: str) -> str:
+    return fitz.get_pdf_str(value) if kind == "string" else value
+
+
+def update_value(widget) -> None:
+    """widget.update() after its value changed, keeping the field's other settings as they were.
+    PyMuPDF rewrites some of those too (such as the border width); in a signed PDF that would count
+    as changing the form itself instead of filling it in, and make the signature show as invalid."""
+    doc = widget.parent.parent
+    x = widget.xref
+    before = {k: doc.xref_get_key(x, k) for k in doc.xref_get_keys(x)}
+    widget.update()
+    for key in doc.xref_get_keys(x):
+        if key in ("V", "AP", "AS"):
+            continue
+        if key not in before:
+            doc.xref_set_key(x, key, "null")
+        elif doc.xref_get_key(x, key) != before[key]:
+            doc.xref_set_key(x, key, _raw_value(*before[key]))
+
+
 def toggle_checkbox(widget) -> None:
     on = widget.on_state() or "Yes"
     widget.field_value = "Off" if widget.field_value not in ("Off", "", None, False) else on
-    widget.update()
+    update_value(widget)
 
 
 def select_radio(page: fitz.Page, widget) -> None:
@@ -363,17 +508,17 @@ def select_radio(page: fitz.Page, widget) -> None:
         for other in p.widgets(types=[fitz.PDF_WIDGET_TYPE_RADIOBUTTON]):
             if other.field_name == name and other.xref != xref and other.field_value not in ("Off", False):
                 other.field_value = "Off"
-                other.update()
+                update_value(other)
     for w in page.widgets(types=[fitz.PDF_WIDGET_TYPE_RADIOBUTTON]):
         if w.xref == xref:
             w.field_value = on
-            w.update()
+            update_value(w)
             break
 
 
 def set_choice(widget, value: str) -> None:
     widget.field_value = value
-    widget.update()
+    update_value(widget)
 
 
 def choice_options(widget) -> list[tuple[str, str]]:
@@ -389,7 +534,7 @@ def choice_options(widget) -> list[tuple[str, str]]:
 
 def set_text_field(doc: fitz.Document, page: fitz.Page, widget, value: str) -> None:
     widget.field_value = value
-    widget.update()
+    update_value(widget)
     if fonts.is_latin1(value):
         return
     # MuPDF can only draw form text with Latin-1 fonts, so write our own appearance with a
@@ -400,6 +545,28 @@ def set_text_field(doc: fitz.Document, page: fitz.Page, widget, value: str) -> N
         pass
 
 
+def _field_font_xref(doc, page, ap_xref: int, buffer: bytes) -> int:
+    """The Unicode font for form text, embedded once and shared by the fields on a page. It is kept
+    in the fields' own appearance resources, never added to the page (which would count as changing
+    the page in a signed PDF)."""
+    candidates = [ap_xref]
+    for w in page.widgets():
+        t, v = doc.xref_get_key(w.xref, "AP/N")
+        if t == "xref":
+            candidates.append(int(v.split()[0]))
+    for x in candidates:
+        t, v = doc.xref_get_key(x, "Resources/Font/PDUni")
+        if t == "xref":
+            return int(v.split()[0])
+    tmp = fitz.open()
+    tmp.new_page().insert_font(fontname="PDUni", fontbuffer=buffer)
+    res = appearance._graft_resources(doc, tmp)
+    if not res:
+        return 0
+    t, v = doc.xref_get_key(res, "Font/PDUni")
+    return int(v.split()[0]) if t == "xref" else 0
+
+
 def _unicode_field_appearance(doc, page, widget, value: str) -> None:
     kind, ap = doc.xref_get_key(widget.xref, "AP/N")
     if kind != "xref":
@@ -407,7 +574,9 @@ def _unicode_field_appearance(doc, page, widget, value: str) -> None:
     ap_xref = int(ap.split()[0])
     choice = fonts.unicode_font()
     font = choice.font
-    font_xref = page.insert_font(fontname="PDUni", fontbuffer=choice.buffer)
+    font_xref = _field_font_xref(doc, page, ap_xref, choice.buffer)
+    if not font_xref:
+        return
     rect = widget.rect
     w, h = rect.width, rect.height
     size = widget.text_fontsize or 0

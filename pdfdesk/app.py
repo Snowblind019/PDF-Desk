@@ -157,8 +157,47 @@ def self_check() -> tuple[bool, str]:
         key, label, ext, kind = convert.export_format(fmt)
         target = os.path.join(tmp, "out" if kind == "folder" else f"out{ext}")
         step(f"Export {label}", lambda f=fmt, t=target: (convert.export_pdf(sample["pdf"], f, t), "")[1])
+    def font_list():
+        from pdfdesk import fontcatalog
+        from pdfdesk import richtext as RT
+        cat = fontcatalog.catalog()
+        cat.start()
+        cat.wait(60)
+        box = RT.Box(paras=[RT.Para([RT.Run("Text ăîșț", cat.default_family(), 12, bold=True)])])
+        RT.render(box, 200)
+        return f"{len(cat.names())} fonts"
+    step("Font list and text boxes", font_list)
+
+    def signatures():
+        from pdfdesk import digitalid
+        if not digitalid.available():
+            raise RuntimeError("pyHanko isn't installed, so Digital ID signing won't work")
+        import datetime as dt
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import pkcs12
+        from cryptography.x509.oid import NameOID
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "PDF Desk check")])
+        now = dt.datetime.now(dt.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - dt.timedelta(minutes=5))
+                .not_valid_after(now + dt.timedelta(days=1)).sign(key, hashes.SHA256()))
+        p12 = os.path.join(tmp, "check.p12")
+        with open(p12, "wb") as fh:
+            fh.write(pkcs12.serialize_key_and_certificates(b"x", key, cert, None,
+                                                           serialization.BestAvailableEncryption(b"checkpass")))
+        result = digitalid.validate(digitalid.sign(sample["pdf"], p12, "checkpass"))[0]
+        if not (result["intact"] and result["valid"]):
+            raise RuntimeError("a test signature didn't check out")
+        return "signing and checking work"
+    step("Digital signatures", signatures)
     lo = externals.libreoffice_command()
     lines.append(("OK    LibreOffice: " + " ".join(lo)) if lo else "--    LibreOffice: not found (optional)")
+    from pdfdesk import speech
+    lines.append("OK    Read Out Loud voice: found" if speech.available()
+                 else "--    Read Out Loud voice: not found (optional)")
     folder, langs = externals.find_tessdata()
     lines.append(f"OK    OCR languages: {', '.join(langs)}" if langs else "--    OCR languages: none found (optional)")
     import shutil

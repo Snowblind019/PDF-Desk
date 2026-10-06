@@ -13,9 +13,11 @@ from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetricsF, QGuiA
 from PySide6.QtWidgets import (QFileDialog, QInputDialog, QMenu, QPlainTextEdit,
                                QScrollArea, QWidget, QFrame)
 
-from pdfdesk import annots, fonts, jobs, pdfops, safety, theme, ui
+from pdfdesk import annots, appearance, fonts, forms, jobs, pdfops, safety, textedit, theme, ui
+from pdfdesk import richtext as RT
 from pdfdesk import tools as T
 from pdfdesk.document import PdfDocument
+from pdfdesk.textformat import RichEditor
 
 PT_TO_PX = 96 / 72
 MARGIN = 18
@@ -130,6 +132,8 @@ class PageCanvas(QWidget):
     open_file_requested = Signal(str)
     signature_needed = Signal()
     page_action_requested = Signal(str, int)  # (action, page) for the main window: rotate_cw, delete...
+    rich_editor_changed = Signal(object)      # the open RichEditor, or None when it closes
+    digital_sign_requested = Signal(int, object, str)  # page, visible rect (or None), existing field name
 
     def __init__(self, view: "DocumentView", pdf: PdfDocument, options: T.ToolOptions, settings):
         super().__init__()
@@ -160,7 +164,11 @@ class PageCanvas(QWidget):
         self.current_hit: tuple[int, int] | None = None
         self.drag: dict | None = None
         self.hover_line: dict | None = None
-        self.editor: InlineEditor | None = None
+        self.editor: InlineEditor | RichEditor | None = None
+        self.format_bar = None  # the main window's text formatting toolbar
+        self.form_edit = False  # Prepare Form mode: fields are selected and moved instead of filled in
+        self._radio_group = ("Choice1", 1)
+        self.poly: dict | None = None  # points of a perimeter/area measurement being drawn
         self._last_click_link = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -413,6 +421,11 @@ class PageCanvas(QWidget):
             return [(fitz.Rect(w.rect), w.field_type, w.xref) for w in p.widgets()]
         return self._cached("widgets", i, produce)
 
+    def fields(self, i: int) -> list:
+        def produce(p):
+            return [(fitz.Rect(w.rect), w.field_type, w.xref, w.field_name or "") for w in p.widgets()]
+        return self._cached("fields", i, produce)
+
     def annot_boxes(self, i: int) -> list:
         def produce(p):
             return [(fitz.Rect(a.rect), a.type[0], a.xref) for a in p.annots()
@@ -487,6 +500,7 @@ class PageCanvas(QWidget):
                 continue  # overlays need page details that can't be loaded while a job runs
             self._paint_overlays(p, i, r)
         self._paint_drag(p)
+        self._paint_poly(p)
         p.end()
         if retry:
             QTimer.singleShot(250, self.update)
@@ -557,6 +571,20 @@ class PageCanvas(QWidget):
                     p.drawRect(cr)
             except Exception:
                 pass
+        if self.form_edit and not (jobs.busy() and ("fields", i) not in self._cache):
+            try:
+                p.setFont(QFont(p.font().family(), 8))
+                for rect, _ftype, _xref, name in self.fields(i):
+                    cr = self.rect_to_canvas(i, rect)
+                    p.fillRect(cr, QColor(70, 130, 255, 46))
+                    p.setPen(QPen(QColor(40, 90, 220), 1))
+                    p.drawRect(cr)
+                    if cr.height() > 12 and cr.width() > 30:
+                        p.setPen(QColor(30, 60, 160))
+                        p.drawText(cr.adjusted(3, 1, -2, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                                   name[:40])
+            except Exception:
+                pass
         hits = self.search_hits.get(i)
         if hits:
             p.setPen(Qt.PenStyle.NoPen)
@@ -566,6 +594,11 @@ class PageCanvas(QWidget):
         if self.sel and self.sel.pno == i:
             for rect in self.sel.rects:
                 p.fillRect(self.rect_to_canvas(i, rect), SEL_COLOR)
+        if self.opt.tool == T.LINK and not (jobs.busy() and ("links", i) not in self._cache):
+            p.setPen(QPen(QColor(47, 128, 237), 1.2, Qt.PenStyle.DashLine))
+            p.setBrush(QColor(47, 128, 237, 30))
+            for link in self.links(i):
+                p.drawRect(self.vis_rect_to_canvas(i, fitz.Rect(link["from"])))
         if self.hover_line and self.hover_line["pno"] == i and self.opt.tool == T.EDIT_TEXT and not self.editor:
             p.setPen(QPen(QColor(theme.ACCENT), 1.2, Qt.PenStyle.DashLine))
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -609,7 +642,9 @@ class PageCanvas(QWidget):
             b = self.vis_to_canvas(i, d["cur"])
             tool = d["tool"]
             pen = QPen(color, max(1.0, self.opt.width * self.scale))
-            if tool in (T.RECT, T.ELLIPSE, T.LINE, T.ARROW):
+            if tool == T.MEASURE:
+                pen = QPen(color, 1.5, Qt.PenStyle.DashLine)
+            if tool in (T.RECT, T.ELLIPSE, T.LINE, T.ARROW, T.MEASURE):
                 p.setPen(pen)
                 p.setOpacity(self.opt.opacity)
                 if tool in (T.RECT, T.ELLIPSE):
@@ -646,6 +681,30 @@ class PageCanvas(QWidget):
             p.drawRect(rr)
         elif kind in ("move", "resize") and d.get("preview") is not None:
             self._paint_selection_box(p, self.vis_rect_to_canvas(i, d["preview"]), kind == "resize")
+        p.restore()
+
+    def _paint_poly(self, p: QPainter) -> None:
+        poly = self.poly
+        if not poly or poly["pno"] >= len(self.page_rects):
+            return
+        i = poly["pno"]
+        pts = [self.vis_to_canvas(i, q) for q in poly["points"] + ([poly["cur"]] if poly.get("cur") else [])]
+        if not pts:
+            return
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(self.opt.color_hex(T.MEASURE))
+        p.setPen(QPen(color, 1.5, Qt.PenStyle.DashLine))
+        fill = QColor(color)
+        fill.setAlpha(40)
+        p.setBrush(fill if self.opt.measure_mode == "area" else Qt.BrushStyle.NoBrush)
+        if self.opt.measure_mode == "area" and len(pts) >= 3:
+            p.drawPolygon(QPolygonF(pts))
+        else:
+            p.drawPolyline(QPolygonF(pts))
+        p.setBrush(color)
+        for q in pts:
+            p.drawEllipse(q, 2.5, 2.5)
         p.restore()
 
     @staticmethod
@@ -730,12 +789,22 @@ class PageCanvas(QWidget):
         if annot is None:
             self.select_annot(None)
             return
+        kind = appearance.kind_of(self.pdf.doc, xref)
         self.sel_annot = {
             "pno": pno, "xref": xref, "type": annot.type[0], "name": annots.type_name(annot),
             "vis": self.page_rect_to_vis(pno, annot.rect), "movable": annots.can_move(annot),
             "resizable": annots.can_resize(annot), "colors": annot.colors, "border": annot.border,
-            "opacity": annot.opacity, "info": annot.info,
+            "opacity": annot.opacity, "info": annot.info, "kind": kind, "rich": kind == RT.KIND,
         }
+        if kind == RT.KIND:
+            box = RT.read_box(self.pdf.doc, xref)
+            if box is not None:
+                self.sel_annot["box"] = box
+                self.sel_annot["opacity"] = box.opacity
+                self.sel_annot["colors"] = {"stroke": fonts.hex_to_rgb(box.first_run().color),
+                                            "fill": fonts.hex_to_rgb(box.fill) if box.fill else None}
+        elif kind:
+            self.sel_annot["opacity"] = appearance.opacity_of(self.pdf.doc, xref)
         self.annot_selected.emit(self.sel_annot)
         self.update()
 
@@ -769,14 +838,105 @@ class PageCanvas(QWidget):
         try:
             with self._edit(f"Delete {sa['name'].lower()}", pages=[sa["pno"]]):
                 page = self.pdf.page(sa["pno"])
-                annot = page.load_annot(sa["xref"])
-                if annot:
-                    page.delete_annot(annot)
+                if sa.get("widget"):
+                    forms.delete_field(page, sa["xref"])
+                else:
+                    annot = page.load_annot(sa["xref"])
+                    if annot:
+                        page.delete_annot(annot)
         except Exception as exc:
             self._fail("Delete", exc)
         self.select_annot(None)
 
-    def restyle_selected(self, color=None, width=None, opacity=None) -> None:
+    def set_form_edit(self, on: bool) -> None:
+        self.commit_editor()
+        self.form_edit = on
+        self.select_annot(None)
+        self.update()
+
+    def select_field(self, pno: int, xref: int) -> None:
+        page = self.pdf.page(pno)
+        w = forms.find_widget(page, xref)
+        if w is None:
+            self.select_annot(None)
+            return
+        kind = forms.kind_of(w.field_type)
+        self.sel_annot = {
+            "pno": pno, "xref": xref, "type": fitz.PDF_ANNOT_WIDGET, "name": forms.KIND_LABELS[kind],
+            "vis": self.page_rect_to_vis(pno, w.rect), "movable": True, "resizable": True, "colors": {},
+            "border": {}, "opacity": 1.0, "info": {}, "kind": "", "rich": False, "widget": True,
+            "field_kind": kind, "field_name": w.field_name or "",
+        }
+        self.annot_selected.emit(self.sel_annot)
+        self.update()
+
+    def field_properties(self) -> None:
+        sa = self.sel_annot
+        if not sa or not sa.get("widget"):
+            return
+        from pdfdesk.dialogs import FieldPropertiesDialog
+        pno, xref = sa["pno"], sa["xref"]
+        props = forms.properties(self.pdf.page(pno), xref)
+        dlg = FieldPropertiesDialog(self, props)
+        if not dlg.exec():
+            return
+        try:
+            with self._edit("Change field", pages=[pno]):
+                forms.set_properties(self.pdf.page(pno), xref, dlg.result_props())
+        except Exception as exc:
+            self._fail("Change field", exc)
+            return
+        self.select_field(pno, xref)
+
+    def _add_field(self, i: int, tool: str, a: fitz.Point, b: fitz.Point, tiny: bool) -> None:
+        kind = T.FIELD_TOOLS[tool]
+        dw, dh = forms.DEFAULT_SIZE[kind]
+        if tiny:
+            rect = fitz.Rect(a.x, a.y - dh / 2, a.x + dw, a.y + dh / 2)
+        else:
+            rect = fitz.Rect(a, b).normalize()
+            if kind in ("check", "radio"):
+                side = max(8.0, min(rect.width, rect.height))
+                rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + side, rect.y0 + side)
+        pr = self.pdf.page_rect(i)
+        rect &= fitz.Rect(0, 0, pr.width, pr.height)
+        if rect.is_empty:
+            return
+        label = forms.KIND_LABELS[kind]
+        try:
+            if kind == "radio":
+                from pdfdesk.dialogs import RadioButtonDialog
+                group, n = self._radio_group
+                groups = sorted(forms.radio_groups(self.pdf.doc))
+                dlg = RadioButtonDialog(self, groups, group, f"Option{n}")
+                if not dlg.exec():
+                    return
+                group, value = dlg.group.currentText().strip(), dlg.value.text().strip()
+                with self._edit(f"Add {label.lower()}", pages=[i]):
+                    xref = forms.add_radio_button(self.pdf.page(i), self.vis_rect_to_page(i, rect), group, value)
+                self._radio_group = (forms.clean_name(group), n + 1)
+            else:
+                with self._edit(f"Add {label.lower()}", pages=[i]):
+                    xref = forms.add_field(self.pdf.page(i), self.vis_rect_to_page(i, rect), kind)
+        except Exception as exc:
+            self._fail(f"Add {label.lower()}", exc)
+            return
+        self.select_field(i, xref)
+        self.message.emit(f"{label} added. Double-click it to set its name and options.")
+
+    def flatten_selected_annot(self) -> None:
+        sa = self.sel_annot
+        if not sa:
+            return
+        try:
+            with self._edit(f"Flatten {sa['name'].lower()}", pages=[sa["pno"]]):
+                if not appearance.flatten_annot(self.pdf.page(sa["pno"]), sa["xref"]):
+                    raise ValueError("This item has no look to keep, so it can't be flattened.")
+        except Exception as exc:
+            self._fail("Flatten", exc)
+        self.select_annot(None)
+
+    def restyle_selected(self, color=None, width=None, opacity=None, fill=annots._KEEP) -> None:
         sa = self.sel_annot
         if not sa:
             return
@@ -784,13 +944,50 @@ class PageCanvas(QWidget):
             with self._edit("Change appearance", pages=[sa["pno"]]):
                 page = self.pdf.page(sa["pno"])
                 annot = page.load_annot(sa["xref"])
-                annots.restyle(self.pdf.doc, annot, color=color, width=width, opacity=opacity)
+                annots.restyle(self.pdf.doc, annot, color=color, width=width, opacity=opacity, fill=fill, page=page)
         except Exception as exc:
             self._fail("Change appearance", exc)
             return
         self.select_annot(sa["pno"], sa["xref"])
 
+    def format_selected(self, change: dict) -> None:
+        """Apply a change from the formatting toolbar to the whole selected text box."""
+        sa = self.sel_annot
+        if not sa or sa["type"] != fitz.PDF_ANNOT_FREE_TEXT:
+            return
+        pno, xref = sa["pno"], sa["xref"]
+        doc = self.pdf.doc
+        if not sa.get("rich") and (appearance.get_key(doc, xref, "IT")[1] == "/FreeTextCallout"
+                                   or (sa.get("info") or {}).get("subject") == "Stamp"):
+            self.message.emit("Callouts and stamps keep their own look; double-click to change their text.")
+            return
+        try:
+            with self._edit("Format text", pages=[pno]):
+                page = self.pdf.page(pno)
+                annot = page.load_annot(xref)
+                box = RT.read_box(self.pdf.doc, xref) if sa.get("rich") else None
+                if box is None:
+                    box = RT.box_from_legacy(page, annot, self.opt.text_style()["font"])
+                    vis = self.page_rect_to_vis(pno, annot.rect)
+                else:
+                    vis = None
+                RT.apply_change(box, change)
+                RT.update(page, xref, box, vis_rect=vis)
+        except Exception as exc:
+            self._fail("Format text", exc)
+            return
+        self.select_annot(pno, xref)
+
     def _apply_transform(self, pno: int, xref: int, new_vis: fitz.Rect, label: str) -> None:
+        if self.sel_annot and self.sel_annot.get("widget") and self.sel_annot["xref"] == xref:
+            try:
+                with self._edit(label, pages=[pno]):
+                    forms.move_field(self.pdf.page(pno), xref, self.vis_rect_to_page(pno, new_vis))
+            except Exception as exc:
+                self._fail(label, exc)
+                return
+            self.select_field(pno, xref)
+            return
         try:
             with self._edit(label, pages=[pno]):
                 page = self.pdf.page(pno)
@@ -856,44 +1053,125 @@ class PageCanvas(QWidget):
         if self.editor is not None:
             self.editor.commit()
 
-    def _new_textbox(self, i: int, vis_rect: fitz.Rect | None, at: fitz.Point) -> None:
-        fs = self.opt.font_size
-        dragged = vis_rect is not None and vis_rect.width > 8 and vis_rect.height > 6
-        if not dragged:
-            vis_rect = fitz.Rect(at.x, at.y - fs * 0.7, at.x + max(120, fs * 12), at.y + fs * 0.9)
-        color = QColor(self.opt.color_hex(T.TEXTBOX))
+    def open_rich_editor(self, i: int, vis_rect: fitz.Rect, box: RT.Box, on_commit, on_cancel=None,
+                         plain: bool = False, single_line: bool = False) -> RichEditor:
+        """Open the formatted-text editor over vis_rect (visible page coordinates) on page i."""
+        self.commit_editor()
+        pr = self.pdf.page_rect(i)
+        max_w = max(40.0, (pr.width - vis_rect.x0) * self.scale)
+        ed = RichEditor(self, box, self.scale, box.auto_width, plain=plain, max_width_px=max_w,
+                        bar=self.format_bar, single_line=single_line)
         cr = self.vis_rect_to_canvas(i, vis_rect)
-        cr.setHeight(max(cr.height(), fs * self.scale * 1.6))
+        first = box.first_run()
+        cr.setHeight(max(cr.height(), first.size * self.scale * 1.5 + 6))
+        cr.setWidth(max(cr.width(), first.size * self.scale * 2))
+        ed.setGeometry(cr.toAlignedRect())
+        ed._grow()
+        self.editor = ed
 
-        def commit(text: str):
-            if not text.strip():
+        def close():
+            if self.editor is ed:
+                self.editor = None
+            ed.hide()
+            ed.deleteLater()
+            self.setFocus()
+            self.rich_editor_changed.emit(None)
+            self.update()
+
+        def done(new_box):
+            close()
+            on_commit(new_box)
+
+        def cancelled():
+            close()
+            if on_cancel:
+                on_cancel()
+
+        ed.committed.connect(done)
+        ed.cancelled.connect(cancelled)
+        ed.show()
+        ed.setFocus()
+        self.rich_editor_changed.emit(ed)
+        self.update()
+        return ed
+
+    def default_box(self) -> RT.Box:
+        st = self.opt.text_style()
+        run = RT.Run("", st["font"], st["size"], bool(st["bold"]), bool(st["italic"]), bool(st["underline"]),
+                     bool(st["strike"]), st["color"], st.get("highlight") or None)
+        fill = self.opt.fill_hex if self.opt.fill else None
+        return RT.Box(paras=[RT.Para([run], align=st["align"], spacing=float(st.get("spacing") or 1.0))], fill=fill)
+
+    def _new_textbox(self, i: int, vis_rect: fitz.Rect | None, at: fitz.Point, box: RT.Box | None = None) -> None:
+        box = box or self.default_box()
+        fs = box.first_run().size
+        dragged = vis_rect is not None and vis_rect.width > 8 and vis_rect.height > 6
+        if dragged:
+            box.auto_width = False
+            box.min_height = vis_rect.height
+            target = fitz.Rect(vis_rect)
+        else:
+            target = fitz.Rect(at.x, at.y - fs * 0.75, at.x + fs * 2, at.y + fs * 0.85)
+
+        def commit(new_box: RT.Box):
+            if new_box.is_empty():
                 return
-            w, h = annots.freetext_size(text, fs)
-            pr = self.pdf.page_rect(i)
-            if dragged:
-                width = max(vis_rect.width, 30)
-                lines = 0
-                for ln in text.splitlines() or [""]:
-                    lines += max(1, math.ceil(fonts.text_width(ln, fs) / max(10, width - fs)))
-                height = max(vis_rect.height, lines * fs * 1.25 + fs * 0.5 + 4)
-                final = fitz.Rect(vis_rect.x0, vis_rect.y0, vis_rect.x0 + width, vis_rect.y0 + height)
-            else:
-                final = fitz.Rect(vis_rect.x0, vis_rect.y0, min(pr.width, vis_rect.x0 + w), vis_rect.y0 + h)
+            new_box.min_height = box.min_height
             try:
                 with self._edit("Add text", pages=[i]):
                     page = self.pdf.page(i)
-                    annots.add_textbox(page, self.vis_rect_to_page(i, final), text, fs, self.opt.color(T.TEXTBOX),
-                                       fill=self.opt.fill_rgb(), author=self._author())
+                    RT.add(page, target, new_box, self._author())
             except Exception as exc:
                 self._fail("Add text", exc)
+                return
+            self._remember_fonts(new_box)
+            self.message.emit("Text added. Double-click it to edit, or select it to change its formatting.")
 
-        self.open_editor(cr, "", self._qfont(fs), color, commit)
+        self.open_rich_editor(i, target, box, commit)
+
+    def _remember_fonts(self, box: RT.Box) -> None:
+        for name in dict.fromkeys(r.font for r in box.runs()):
+            self.opt.add_recent_font(name)
 
     def _edit_freetext(self, pno: int, xref: int) -> None:
         page = self.pdf.page(pno)
         annot = page.load_annot(xref)
         if annot is None:
             return
+        doc = self.pdf.doc
+        if appearance.get_key(doc, xref, "IT")[1] == "/FreeTextCallout" or (annot.info or {}).get("subject") == "Stamp":
+            self._edit_freetext_plain(pno, xref)  # callouts and stamps keep their simple editor
+            return
+        rich = RT.is_rich(doc, xref)
+        box = RT.read_box(doc, xref) if rich else None
+        if box is None:
+            box = RT.box_from_legacy(page, annot, self.opt.text_style()["font"])
+        vis = self.page_rect_to_vis(pno, annot.rect)
+        before = box.to_json()
+
+        def commit(new_box: RT.Box):
+            if new_box.to_json() == before:
+                return  # nothing changed: leave the box (and boxes made by other programs) exactly as it was
+            try:
+                with self._edit("Edit text box", pages=[pno]):
+                    pg = self.pdf.page(pno)
+                    a = pg.load_annot(xref)
+                    if new_box.is_empty():
+                        pg.delete_annot(a)
+                        return
+                    RT.update(pg, xref, new_box, vis_rect=vis)
+            except Exception as exc:
+                self._fail("Edit text box", exc)
+                return
+            self._remember_fonts(new_box)
+            self.select_annot(pno, xref)
+
+        self.select_annot(None)
+        self.open_rich_editor(pno, vis, box, commit)
+
+    def _edit_freetext_plain(self, pno: int, xref: int) -> None:
+        page = self.pdf.page(pno)
+        annot = page.load_annot(xref)
         size, color = annots.freetext_style(self.pdf.doc, annot)
         vis = self.page_rect_to_vis(pno, annot.rect)
         text = annot.info.get("content", "")
@@ -933,9 +1211,12 @@ class PageCanvas(QWidget):
         try:
             with self._edit("Edit note", pages=[pno]):
                 pg = self.pdf.page(pno)
-                a = pg.load_annot(xref)
-                a.set_info(content=text)
-                a.update()
+                if appearance.kind_of(self.pdf.doc, xref):
+                    appearance.set_info(self.pdf.doc, xref, contents=text)  # keep PDF Desk's own drawing
+                else:
+                    a = pg.load_annot(xref)
+                    a.set_info(content=text)
+                    a.update()
         except Exception as exc:
             self._fail("Edit note", exc)
 
@@ -948,54 +1229,41 @@ class PageCanvas(QWidget):
         else:
             self._edit_note(sa["pno"], sa["xref"])
 
-    def _line_at(self, i: int, pt: fitz.Point) -> dict | None:
-        derot = self._info(i)[2]
-        expect = fitz.Point(derot.a, derot.b)
-        for block in self.text_dict(i).get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                bbox = fitz.Rect(line["bbox"])
-                if not bbox.contains(pt):
-                    continue
-                spans = [s for s in line["spans"] if s["text"]]
-                if not spans:
-                    continue
-                d = line.get("dir", (1, 0))
-                horizontal = abs(d[0] * expect.x + d[1] * expect.y) > 0.98
-                main = max(spans, key=lambda s: len(s["text"].strip()))
-                family, bold, italic = fonts.span_style(main)
-                return {"pno": i, "bbox": bbox, "origin": fitz.Point(spans[0]["origin"]),
-                        "text": "".join(s["text"] for s in spans), "size": main["size"],
-                        "color": fonts.int_to_rgb(main.get("color", 0)), "family": family,
-                        "bold": bold, "italic": italic, "editable": horizontal}
-        return None
+    def page_lines(self, i: int) -> list:
+        return self._cached("lines", i, lambda p: textedit.page_lines(p, self.text_dict(i)))
 
-    def _edit_line(self, line: dict) -> None:
-        if not line["editable"]:
-            self.message.emit("Only text that runs left to right on the page can be edited.")
+    def _para_at(self, i: int, pt: fitz.Point) -> dict | None:
+        page = self.pdf.page(i)
+        return textedit.block_at(page, {}, pt, lines=self.page_lines(i))
+
+    def _edit_paragraph(self, info: dict) -> None:
+        """Edit text that is part of the page, a paragraph at a time, with the fonts toolbar."""
+        if not info["editable"]:
+            self.message.emit("Only text that reads left to right on the page can be edited.")
             return
-        i = line["pno"]
-        vis = self.page_rect_to_vis(i, line["bbox"])
-        cr = self.vis_rect_to_canvas(i, vis).adjusted(-3, -2, 30, 2)
-        font = self._qfont(line["size"], line["family"], line["bold"], line["italic"])
-        color = QColor.fromRgbF(*line["color"])
-        old = line["text"]
+        i = info["pno"]
+        page = self.pdf.page(i)
+        box = textedit.block_to_box(page, info)
+        vis = self.page_rect_to_vis(i, info["bbox"])
+        single = len(info["lines"]) == 1
+        box.auto_width = single
+        before = box.to_json()
+        target = fitz.Rect(vis.x0 - 2, vis.y0 - 1, vis.x1 + 2, vis.y1 + 1)
 
-        def commit(new_text: str):
-            new_text = new_text.replace("\n", " ")
-            if new_text == old:
+        def commit(new_box: RT.Box):
+            if new_box.to_json() == before:
                 return
             try:
                 with self._edit("Edit text", pages=[i]):
-                    page = self.pdf.page(i)
-                    pdfops.replace_text_line(page, line["bbox"], line["origin"], new_text, line["size"],
-                                             line["color"], line["family"], line["bold"], line["italic"])
+                    textedit.replace_block(self.pdf.page(i), info, new_box)
             except Exception as exc:
                 self._fail("Edit text", exc)
+                return
+            self._remember_fonts(new_box)
 
         self.hover_line = None
-        self.open_editor(cr, old, font, color, commit, single_line=True)
+        ed = self.open_rich_editor(i, target, box, commit, single_line=False)
+        ed.setStyleSheet(ed.styleSheet().replace(",235)", ",255)"))
 
     # ================================================================== creating things
     def _make_markup(self, kind: str, sel: TextSelection) -> None:
@@ -1078,9 +1346,145 @@ class PageCanvas(QWidget):
             if not sig or not os.path.exists(sig):
                 self.signature_needed.emit()
                 return
-            self._place_image_file(i, a, b, sig, "Add signature", default_w=160)
+            self._place_image_file(i, a, b, sig, "Add signature", default_w=160, kind="Signature")
+        elif tool == T.FILLSIGN:
+            self._fill_and_sign(i, a, b, tiny)
+        elif tool in T.FIELD_TOOLS:
+            self._add_field(i, tool, a, b, tiny)
+        elif tool == T.LINK:
+            if tiny:
+                self.message.emit("Drag a box over the text or picture that should become a link.")
+                return
+            self._new_link(i, fitz.Rect(a, b).normalize())
+        elif tool == T.MEASURE:
+            if tiny:
+                self.message.emit("Drag from one point to another to measure the distance.")
+                return
+            self._add_measure(i, "distance", [a, b])
+        elif tool == T.DIGISIGN:
+            if tiny:
+                self.message.emit("Drag a box where the signature should appear.")
+                return
+            self.digital_sign_requested.emit(i, fitz.Rect(a, b).normalize(), "")
+        elif tool == T.SNAPSHOT:
+            if tiny:
+                self.message.emit("Drag a box around the part of the page you want to copy.")
+                return
+            self.snapshot(i, fitz.Rect(a, b).normalize())
 
-    def _place_image_file(self, i, a, b, path, label, default_w=200) -> None:
+    def snapshot(self, i: int, vis_rect: fitz.Rect) -> None:
+        page = self.pdf.page(i)
+        zoom = fonts.safe_zoom(vis_rect, 2.0 * self.devicePixelRatioF() if self.devicePixelRatioF() > 1 else 2.0)
+        pix = page.get_displaylist(annots=True).get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=vis_rect, alpha=False)
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+        QGuiApplication.clipboard().setImage(img)
+        self.message.emit(f"Copied a picture of that area ({pix.width} x {pix.height} pixels). Paste it anywhere.")
+
+    def _add_measure(self, i: int, mode: str, vis_points: list) -> None:
+        from pdfdesk import measure
+        try:
+            with self._edit("Measure", pages=[i]):
+                measure.add(self.pdf.page(i), mode, vis_points, self.opt.measure_scale(),
+                            self.opt.color(T.MEASURE), self._author())
+        except Exception as exc:
+            self._fail("Measure", exc)
+            return
+        label = measure.result_text(mode, [fitz.Point(q) for q in vis_points], self.opt.measure_scale())
+        self.message.emit(f"{mode.capitalize()}: {label}")
+
+    def _poly_click(self, i: int, vis: fitz.Point) -> None:
+        if self.poly is None or self.poly["pno"] != i:
+            self.poly = {"pno": i, "points": [vis], "cur": vis}
+            self.message.emit("Click each corner. Double-click (or press Enter) on the last one to finish, "
+                              "Esc to cancel.")
+        else:
+            last = self.poly["points"][-1]
+            if abs(last.x - vis.x) + abs(last.y - vis.y) > 1:
+                self.poly["points"].append(vis)
+        self.update()
+
+    def finish_poly(self) -> None:
+        poly, self.poly = self.poly, None
+        self.update()
+        if not poly:
+            return
+        mode = self.opt.measure_mode
+        pts = poly["points"]
+        if len(pts) < (3 if mode == "area" else 2):
+            self.message.emit("Not enough points to measure.")
+            return
+        self._add_measure(poly["pno"], mode, pts)
+
+    def _new_link(self, i: int, vis_rect: fitz.Rect) -> None:
+        from pdfdesk import docfeatures
+        from pdfdesk.dialogs import LinkDialog
+        dlg = LinkDialog(self, self.pdf.page_count, {"page": min(self.pdf.page_count - 1, i + 1)})
+        if not dlg.exec():
+            return
+        try:
+            with self._edit("Add link", pages=[i]):
+                docfeatures.add_link(self.pdf.page(i), vis_rect, dlg.target())
+        except Exception as exc:
+            self._fail("Add link", exc)
+
+    def _edit_link(self, i: int, link: dict) -> None:
+        from pdfdesk import docfeatures
+        from pdfdesk.dialogs import LinkDialog
+        xref = link.get("xref")
+        dlg = LinkDialog(self, self.pdf.page_count, docfeatures.link_target(link), can_delete=True)
+        if not dlg.exec() or not xref:
+            return
+        try:
+            with self._edit("Delete link" if dlg.deleted else "Change link", pages=[i]):
+                page = self.pdf.page(i)
+                if dlg.deleted:
+                    docfeatures.delete_link(page, xref)
+                else:
+                    docfeatures.replace_link(page, xref, dlg.target())
+        except Exception as exc:
+            self._fail("Change link", exc)
+
+    def _fill_and_sign(self, i: int, a: fitz.Point, b: fitz.Point, tiny: bool) -> None:
+        mode = self.opt.fillsign_mode
+        color = self.opt.color(T.FILLSIGN)
+        if mode in ("check", "cross", "dot"):
+            kind = {"check": "Check", "cross": "Cross", "dot": "Dot"}[mode]
+            size = max(6.0, self.opt.font_size * 1.1)
+            rect = self._place_rect(i, a, b, size, size)
+            if not tiny:  # keep marks square
+                side = min(rect.width, rect.height)
+                rect = fitz.Rect(rect.x0, rect.y0, rect.x0 + side, rect.y0 + side)
+            try:
+                with self._edit(f"Add {kind.lower()}", pages=[i]):
+                    annots.add_mark(self.pdf.page(i), self.vis_rect_to_page(i, rect), kind, color, self._author())
+            except Exception as exc:
+                self._fail("Fill & Sign", exc)
+            return
+        st = self.opt.text_style()
+        run = RT.Run("", st["font"], st["size"], color=fonts.rgb_to_hex(color))
+        box = RT.Box(paras=[RT.Para([run])], padding=1)
+        if mode == "text":
+            self._new_textbox(i, None if tiny else fitz.Rect(a, b).normalize(), a, box=box)
+            return
+        import datetime as _dt
+        if mode == "date":
+            fmt = self.settings.get("date_format") or "%m/%d/%Y"
+            try:
+                run.text = _dt.date.today().strftime(fmt)[:60]
+            except (ValueError, TypeError):
+                run.text = _dt.date.today().isoformat()
+        else:
+            run.text = self.opt.initials
+            run.italic = True
+        fs = run.size
+        target = fitz.Rect(a.x, a.y - fs * 0.75, a.x + fs * 2, a.y + fs * 0.85)
+        try:
+            with self._edit("Fill & Sign", pages=[i]):
+                RT.add(self.pdf.page(i), target, box, self._author())
+        except Exception as exc:
+            self._fail("Fill & Sign", exc)
+
+    def _place_image_file(self, i, a, b, path, label, default_w=200, kind="Image") -> None:
         try:
             data = Path(path).read_bytes()
             from pdfdesk.convert import _image_bytes_for_mupdf
@@ -1094,9 +1498,12 @@ class PageCanvas(QWidget):
         rect = self._place_rect(i, a, b, min(default_w, pr.width * 0.6), 0, ratio)
         try:
             with self._edit(label, pages=[i]):
-                annots.add_image(self.pdf.page(i), self.vis_rect_to_page(i, rect), data)
+                annots.add_image_annot(self.pdf.page(i), self.vis_rect_to_page(i, rect), data, kind, self._author())
         except Exception as exc:
             self._fail(label, exc)
+            return
+        self.message.emit("Placed. Select it to move or resize it; right-click and choose Flatten to make it "
+                          "a permanent part of the page.")
 
     def _finish_ink(self, d: dict) -> None:
         pts = d["points"]
@@ -1189,7 +1596,10 @@ class PageCanvas(QWidget):
 
             self.open_editor(cr, old, self._qfont(size), QColor("#000000"), commit, single_line=not multiline)
         elif ftype == fitz.PDF_WIDGET_TYPE_SIGNATURE:
-            self.message.emit("Digital signature fields aren't supported. Use the Signature tool to place your signature.")
+            if appearance.get_key(self.pdf.doc, xref, "V")[0] != "null":
+                self.message.emit("This field is already signed. Use Tools > Check signatures to see the details.")
+            else:
+                self.digital_sign_requested.emit(i, None, name or "")
         return True
 
     def _link_at(self, i: int, vis: fitz.Point):
@@ -1289,7 +1699,15 @@ class PageCanvas(QWidget):
                              "handle": handle, "orig": fitz.Rect(self.sel_annot["vis"]), "start": vis,
                              "preview": None}
                 return
-            if self._click_widget(i, pt):
+            if self.form_edit:
+                hit = next((x for r, _t, x, _n in reversed(self.fields(i)) if r.contains(pt)), None)
+                if hit is not None:
+                    self.clear_selection()
+                    self.select_field(i, hit)
+                    self.drag = {"kind": "move", "pno": i, "xref": hit, "orig": fitz.Rect(self.sel_annot["vis"]),
+                                 "start": vis, "preview": None}
+                    return
+            elif self._click_widget(i, pt):
                 return
             page = self.pdf.page(i)
             annot = annots.annot_at(page, pt)
@@ -1317,18 +1735,27 @@ class PageCanvas(QWidget):
                 self.drag = {"kind": "text", "pno": i, "anchor": pt}
             else:
                 self.drag = {"kind": "area", "pno": i, "start": vis, "cur": vis}
-        elif tool in (T.RECT, T.ELLIPSE, T.LINE, T.ARROW, T.TEXTBOX, T.STAMP, T.IMAGE, T.SIGNATURE):
+        elif tool == T.MEASURE and self.opt.measure_mode != "distance":
+            self._poly_click(i, vis)
+        elif tool in (T.RECT, T.ELLIPSE, T.LINE, T.ARROW, T.TEXTBOX, T.STAMP, T.IMAGE, T.SIGNATURE, T.FILLSIGN,
+                      T.MEASURE, T.SNAPSHOT, T.DIGISIGN) or tool in T.FIELD_TOOLS:
             self.drag = {"kind": "shape", "pno": i, "tool": tool, "start": vis, "cur": vis, "shift": shift}
         elif tool == T.PEN:
             self.drag = {"kind": "ink", "pno": i, "points": [vis]}
+        elif tool == T.LINK:
+            link = self._link_at(i, vis)
+            if link is not None:
+                self._edit_link(i, link)
+            else:
+                self.drag = {"kind": "shape", "pno": i, "tool": tool, "start": vis, "cur": vis, "shift": False}
         elif tool == T.NOTE:
             self._add_note(i, vis)
         elif tool == T.EDIT_TEXT:
-            line = self._line_at(i, pt)
-            if line:
-                self._edit_line(line)
+            para = self._para_at(i, pt)
+            if para:
+                self._edit_paragraph(para)
             else:
-                self.message.emit("Click directly on a line of text to edit it.")
+                self.message.emit("Click on some text to edit it.")
 
     def mouseMoveEvent(self, ev) -> None:
         if jobs.busy():  # never touch the document while a background job is running
@@ -1336,6 +1763,15 @@ class PageCanvas(QWidget):
         pos = ev.position()
         d = self.drag
         if d is None:
+            if self.poly is not None:
+                i = self.poly["pno"]
+                self.poly["cur"] = self.clamp_vis(i, self.to_vis(i, pos))
+                from pdfdesk import measure
+                pts = self.poly["points"] + [self.poly["cur"]]
+                mode = self.opt.measure_mode
+                if len(pts) >= (3 if mode == "area" else 2):
+                    self.message.emit(f"{mode.capitalize()}: {measure.result_text(mode, pts, self.opt.measure_scale())}")
+                self.update()
             self._update_hover(pos)
             return
         kind = d["kind"]
@@ -1444,9 +1880,21 @@ class PageCanvas(QWidget):
             return
         pos = ev.position()
         i = self.page_at(pos)
+        if self.poly is not None and self.opt.tool == T.MEASURE:
+            if i == self.poly["pno"]:
+                self._poly_click(i, self.clamp_vis(i, self.to_vis(i, pos)))  # same spot twice is ignored
+            self.finish_poly()
+            return
         if i is None or self.opt.tool != T.SELECT:
             return
         pt = self.to_page(i, pos)
+        if self.form_edit:
+            hit = next((x for r, _t, x, _n in reversed(self.fields(i)) if r.contains(pt)), None)
+            if hit is not None:
+                self.drag = None
+                self.select_field(i, hit)
+                self.field_properties()
+                return
         page = self.pdf.page(i)
         annot = annots.annot_at(page, pt)
         if annot is not None:
@@ -1481,7 +1929,7 @@ class PageCanvas(QWidget):
                 if self._handle_hit(pos) is not None:
                     cursor = Qt.CursorShape.SizeAllCursor
                 elif any(r.contains(pt) for r, ft, _x in self.widgets(i)):
-                    cursor = Qt.CursorShape.PointingHandCursor
+                    cursor = Qt.CursorShape.SizeAllCursor if self.form_edit else Qt.CursorShape.PointingHandCursor
                 elif any((r + (-3, -3, 3, 3)).contains(pt) for r, t, _x in self.annot_boxes(i)
                          if t not in annots.MARKUP_TYPES):
                     cursor = Qt.CursorShape.SizeAllCursor
@@ -1492,7 +1940,11 @@ class PageCanvas(QWidget):
             elif tool in T.TEXT_TOOLS:
                 cursor = Qt.CursorShape.IBeamCursor if self._word_under(i, pt) else Qt.CursorShape.CrossCursor
             elif tool == T.EDIT_TEXT:
-                line = self._line_at(i, pt)
+                hl = self.hover_line
+                if hl and hl["pno"] == i and (hl["bbox"] + (-1, -1, 1, 1)).contains(pt):
+                    self.setCursor(Qt.CursorShape.IBeamCursor)
+                    return  # still over the same paragraph: no need to look again
+                line = self._para_at(i, pt)
                 if (line and self.hover_line and line["bbox"] == self.hover_line["bbox"]
                         and line["pno"] == self.hover_line["pno"]):
                     pass
@@ -1535,6 +1987,13 @@ class PageCanvas(QWidget):
         if key in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.sel_annot:
             self.delete_selected_annot()
             return
+        if self.poly is not None and key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.finish_poly()
+            return
+        if key == Qt.Key.Key_Escape and self.poly is not None:
+            self.poly = None
+            self.update()
+            return
         if key == Qt.Key.Key_Escape:
             if self.drag:
                 self.drag = None
@@ -1564,6 +2023,7 @@ class PageCanvas(QWidget):
     def _on_tool_changed(self, tool: str) -> None:
         self.commit_editor()
         self.drag = None
+        self.poly = None
         self.hover_line = None
         if tool != T.SELECT:
             self.select_annot(None)
@@ -1591,13 +2051,23 @@ class PageCanvas(QWidget):
             menu.addAction("Strikethrough", lambda: self.markup_selection("strikeout"))
             menu.addAction("Mark for redaction", lambda: self.markup_selection("redact"))
             menu.addSeparator()
-        if self.sel_annot:
+        if self.form_edit and i is not None:
+            pt = self.to_page(i, pos)
+            hit = next((x for r, _t, x, _n in reversed(self.fields(i)) if r.contains(pt)), None)
+            if hit is not None:
+                self.select_field(i, hit)
+        if self.sel_annot and self.sel_annot.get("widget"):
+            menu.addAction("Field properties...", self.field_properties)
+            menu.addAction("Delete field", self.delete_selected_annot)
+            menu.addSeparator()
+        elif self.sel_annot:
             sa = self.sel_annot
             if sa["type"] == fitz.PDF_ANNOT_FREE_TEXT:
                 menu.addAction("Edit text", self.edit_annot_content)
             else:
                 menu.addAction("Edit comment...", self.edit_annot_content)
             menu.addAction(f"Delete {sa['name'].lower()}", self.delete_selected_annot)
+            menu.addAction("Flatten (make part of the page)", self.flatten_selected_annot)
             menu.addSeparator()
         if i is not None:
             vis = self.to_vis(i, pos)

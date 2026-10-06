@@ -13,15 +13,17 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFileDia
                                QToolButton, QWidget, QSizePolicy, QCheckBox)
 
 from pdfdesk import ui
-from pdfdesk import APP_NAME, annots, convert, dialogs, icons, jobs, pdfops, printing, theme
+from pdfdesk import (APP_NAME, annots, compare, convert, dialogs, docfeatures, forms, icons, jobs, measure, pdfops,
+                     printing, safety, speech, theme)
 from pdfdesk import tools as T
 from pdfdesk.config import settings as get_settings
 from pdfdesk.doctab import DocumentTab
-from pdfdesk.document import NeedsPassword, PdfDocument
+from pdfdesk.document import NeedsPassword, PdfDocument, write_file_safely
 from pdfdesk.fonts import hex_to_rgb, rgb_to_hex
 from pdfdesk.home import HomePage
 from pdfdesk.recents import RecentFiles
 from pdfdesk.signature import SignatureDialog, list_signatures
+from pdfdesk.textformat import RichEditor, TextFormatBar
 from pdfdesk.widgets import ColorButton
 
 ZOOM_PRESETS = ["Fit width", "Fit page", "50%", "75%", "100%", "125%", "150%", "200%", "300%", "400%"]
@@ -62,6 +64,10 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
         self.tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.LeftSide, None)
 
+        self.reader = speech.Reader(self)
+        self.reader.started_piece.connect(self._reading_piece)
+        self.reader.finished.connect(lambda: self.statusBar().showMessage("Finished reading.", 3000))
+        self.reader.failed.connect(lambda m: ui.information(self, "Read out loud", m))
         self._build_actions()
         self._build_menus()
         self._build_toolbars()
@@ -106,6 +112,13 @@ class MainWindow(QMainWindow):
             self.doc_actions.append(a)
         self.addAction(a)
         return a
+
+    def doc_base(self, pdf) -> Path:
+        """Folder and safe file-name stem to suggest when saving something made from this document."""
+        from pdfdesk import safety
+        stem = safety.safe_filename_part(Path(pdf.path or pdf.title or "").stem) or "Document"
+        folder = os.path.dirname(pdf.path or pdf.suggested_path or "") or self.settings.get("last_dir")
+        return Path(folder) / stem
 
     def msg(self, text: str, ms: int = 5000) -> None:
         self.statusBar().showMessage(text, ms)
@@ -168,6 +181,14 @@ class MainWindow(QMainWindow):
           tip="Night mode: dark pages for reading in the dark (Ctrl+Shift+N)")
         a("forms", "Highlight form fields", self.toggle_forms, None, "text-cursor-input", doc=False, checkable=True)
         a("fullscreen", "Full screen", self.toggle_fullscreen, "F11", "maximize-2", doc=False, checkable=True)
+        a("present", "Presentation", self.present, "F5", "presentation", tip="Show the pages full screen (F5)")
+        a("reader", "Reader view", self.reader_view, "Ctrl+4", "book-open-text",
+          tip="Read the text reflowed, with large letters (Ctrl+4)")
+        a("read_page", "Read this page out loud", lambda: self.read_aloud("page"), "Ctrl+Shift+Y", "volume-2")
+        a("read_end", "Read to the end", lambda: self.read_aloud("end"), "Ctrl+Shift+B")
+        a("read_selection", "Read the selected text", lambda: self.read_aloud("selection"))
+        a("read_stop", "Stop reading", self.stop_reading, "Ctrl+Shift+E", "volume-x", doc=False)
+        a("read_speed", "Reading speed...", self.reading_speed, None, None, doc=False)
         self.layout_group = QActionGroup(self)
         for key, label in (("single", "One page, scrolling"), ("facing", "Two pages"), ("cover", "Two pages with cover")):
             act = a(f"layout_{key}", label, lambda on, k=key: on and self.set_layout(k), None, None, checkable=True)
@@ -193,6 +214,12 @@ class MainWindow(QMainWindow):
         a("header_footer", "Header, footer and page numbers...", self.header_footer, None, "panel-top")
         a("watermark", "Watermark...", self.watermark, None, "droplet")
         a("bookmark", "Add bookmark for this page...", self.add_bookmark, "Ctrl+B", "bookmark")
+        a("page_labels", "Page labels...", self.page_labels, None, "tag")
+        a("background", "Background...", self.background, None, "paint-bucket")
+        a("page_size", "Page size...", self.page_size, None, "scaling")
+        a("blank_pages", "Remove blank pages...", self.remove_blank_pages, None, "file-x")
+        a("nup", "Pages per sheet...", lambda: self.print_layout(False), None, "grid-2x2")
+        a("booklet", "Booklet...", lambda: self.print_layout(True), None, "book-open")
 
         a("compress", "Reduce file size...", self.compress, None, "shrink")
         a("protect", "Protect with password...", self.protect, None, "lock")
@@ -204,6 +231,22 @@ class MainWindow(QMainWindow):
         a("flatten", "Flatten comments and forms", self.flatten, None, "layers")
         a("hidden", "Remove hidden information...", self.remove_hidden, None, "eraser")
         a("signatures", "Manage signatures...", self.manage_signatures, None, "signature", doc=False)
+        a("grayscale", "Convert to grayscale", self.grayscale, None, "contrast")
+        a("compare", "Compare files...", self.compare_files, None, "git-compare")
+        a("auto_bookmarks", "Make bookmarks from headings", self.auto_bookmarks, None, "bookmark-plus")
+        a("measure_scale", "Measuring scale...", self.measure_scale, None, "ruler", doc=False)
+        a("digital_sign", "Sign with Digital ID...", self.start_digital_sign, None, "badge-check")
+        a("check_signatures", "Check signatures...", self.check_signatures, None, "shield-check")
+        a("digital_ids", "Digital IDs...", self.manage_digital_ids, None, "key-round", doc=False)
+        a("extract_images", "Save all pictures...", self.extract_images, None, "images")
+        a("export_comments", "Comment summary...", self.export_comments, None, "messages-square")
+        a("attach_file", "Attach a file...", self.attach_file, None, "paperclip")
+        a("prepare_form", "Prepare form", self.toggle_prepare_form, None, "file-check", checkable=True,
+          tip="Prepare form: add, move and change form fields")
+        a("detect_fields", "Find form fields automatically", self.detect_fields, None, "wand-sparkles")
+        a("clear_form", "Clear form", self.clear_form, None, "eraser")
+        a("export_form", "Export form data...", self.export_form_data, None, "file-output")
+        a("import_form", "Import form data...", self.import_form_data, None, "file-input")
 
         a("shortcuts", "Keyboard shortcuts", lambda: dialogs.ShortcutsDialog(self).exec(), "F1", doc=False)
         a("extras", "Optional extras (LibreOffice, OCR)", self.extras_help, None, doc=False)
@@ -240,6 +283,10 @@ class MainWindow(QMainWindow):
         for key, label, ext, kind in convert.EXPORT_FORMATS:
             act = self.export_menu.addAction(label, lambda k=key: self.export(k))
             self.doc_actions.append(act)
+        self.export_menu.addSeparator()
+        self.export_menu.addAction(self.act["extract_images"])
+        self.export_menu.addAction(self.act["export_comments"])
+        self.export_menu.addAction(self.act["export_form"])
         m.addSeparator()
         for k in ("print", "properties", "show_folder"):
             m.addAction(self.act[k])
@@ -261,19 +308,28 @@ class MainWindow(QMainWindow):
         tm = m.addMenu("Theme")
         for k in ("system", "light", "dark"):
             tm.addAction(self.act[f"theme_{k}"])
-        for k in ("night", "forms", "sidebar", "fullscreen", None, "goto", "first", "prev", "next", "last"):
+        for k in ("night", "forms", "sidebar", "fullscreen", None, "present", "reader", None, "goto", "first", "prev",
+                  "next", "last"):
             m.addSeparator() if k is None else m.addAction(self.act[k])
+        rm = m.addMenu(icons.icon("volume-2"), "Read out loud")
+        for k in ("read_page", "read_end", "read_selection", None, "read_stop", "read_speed"):
+            rm.addSeparator() if k is None else rm.addAction(self.act[k])
 
         m = mb.addMenu("&Pages")
         for k in ("organize", None, "rotate_cw", "rotate_ccw", "rotate_pages", None, "insert_blank", "insert_file",
-                  "duplicate", "delete_pages", None, "extract", "split", None, "crop", "header_footer", "watermark",
-                  None, "bookmark"):
+                  "duplicate", "delete_pages", "blank_pages", None, "extract", "split", None, "crop", "page_size",
+                  "header_footer", "watermark", "background", "page_labels", None, "nup", "booklet", None, "bookmark",
+                  "auto_bookmarks"):
             m.addSeparator() if k is None else m.addAction(self.act[k])
 
         m = mb.addMenu("&Tools")
-        for k in ("compress", "ocr", None, "protect", "unprotect", None, "find_redact", "apply_redact", "hidden",
-                  None, "flatten", "signatures"):
+        for k in ("compare", None, "compress", "ocr", "grayscale", None, "protect", "unprotect", None, "find_redact",
+                  "apply_redact", "hidden", None, "flatten", "signatures", None, "digital_sign", "check_signatures",
+                  "digital_ids", None, "attach_file", "extract_images", "export_comments", "measure_scale"):
             m.addSeparator() if k is None else m.addAction(self.act[k])
+        fm = m.addMenu(icons.icon("file-check"), "Forms")
+        for k in ("prepare_form", "detect_fields", None, "clear_form", "export_form", "import_form"):
+            fm.addSeparator() if k is None else fm.addAction(self.act[k])
 
         m = mb.addMenu("&Help")
         for k in ("shortcuts", "extras", None, "about"):
@@ -311,7 +367,7 @@ class MainWindow(QMainWindow):
         tb.addAction(self.act["fit_width"])
         tb.addAction(self.act["fit_page"])
         tb.addSeparator()
-        for k in ("sidebar", "organize", "find", "night"):
+        for k in ("sidebar", "organize", "find", "night", "reader", "present"):
             tb.addAction(self.act[k])
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -328,7 +384,8 @@ class MainWindow(QMainWindow):
         self.tools_tb = et
         groups = [[T.SELECT, T.HAND], [T.HIGHLIGHT, T.UNDERLINE, T.STRIKEOUT],
                   [T.NOTE, T.TEXTBOX, T.PEN, T.RECT, T.ELLIPSE, T.LINE, T.ARROW],
-                  [T.STAMP, T.IMAGE, T.SIGNATURE], [T.EDIT_TEXT, T.REDACT]]
+                  [T.STAMP, T.IMAGE, T.SIGNATURE, T.FILLSIGN], [T.EDIT_TEXT, T.LINK, T.REDACT],
+                  [T.MEASURE, T.SNAPSHOT]]
         for gi, group in enumerate(groups):
             if gi:
                 et.addSeparator()
@@ -343,6 +400,12 @@ class MainWindow(QMainWindow):
                 if tool == T.STAMP:
                     b.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
                     b.setMenu(self._stamp_menu())
+                if tool == T.FILLSIGN:
+                    b.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+                    b.setMenu(self._fillsign_menu())
+                if tool == T.MEASURE:
+                    b.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+                    b.setMenu(self._measure_menu())
                 if tool == T.SIGNATURE:
                     b.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
                     menu = QMenu(b)
@@ -359,10 +422,10 @@ class MainWindow(QMainWindow):
         self.fill_check = QCheckBox("Fill")
         self.fill_check.setToolTip("Fill shapes and text boxes")
         self.fill_check.setChecked(self.opt.fill)
-        self.fill_check.toggled.connect(self.opt.set_fill)
+        self.fill_check.toggled.connect(self._fill_toggled)
         self.w_fill = et.addWidget(self.fill_check)
         self.fill_btn = ColorButton(self.opt.fill_hex, "Fill color")
-        self.fill_btn.color_changed.connect(self.opt.set_fill_color)
+        self.fill_btn.color_changed.connect(self._fill_color_picked)
         self.w_fill_color = et.addWidget(self.fill_btn)
         self.width_box = QDoubleSpinBox()
         self.width_box.setRange(0.5, 20)
@@ -380,18 +443,59 @@ class MainWindow(QMainWindow):
         self.opacity_box.setValue(int(self.opt.opacity * 100))
         self.opacity_box.valueChanged.connect(self._opacity_picked)
         self.w_opacity = et.addWidget(self.opacity_box)
-        self.font_box = QSpinBox()
-        self.font_box.setRange(4, 144)
-        self.font_box.setSuffix(" pt")
-        self.font_box.setToolTip("Text size")
-        self.font_box.setValue(int(self.opt.font_size))
-        self.font_box.valueChanged.connect(lambda v: self.opt.set_font_size(v))
-        self.w_font = et.addWidget(self.font_box)
         et.addAction(self.act["delete_sel"])
         self.tool_hint = QLabel()
+        self.tool_hint.setTextFormat(Qt.TextFormat.PlainText)  # can include field names from the PDF
         self.tool_hint.setObjectName("muted")
         self.tool_hint.setContentsMargins(10, 0, 4, 0)
         et.addWidget(self.tool_hint)
+
+        # ---- Prepare Form (shown while editing form fields)
+        self.addToolBarBreak()
+        fb = QToolBar("Prepare form")
+        fb.setObjectName("formToolbar")
+        fb.setMovable(False)
+        fb.setIconSize(QSize(20, 20))
+        self.addToolBar(fb)
+        self.form_bar = fb
+        title = QLabel("  Prepare form:  ")
+        title.setObjectName("muted")
+        fb.addWidget(title)
+        fb.addAction(self.act["prepare_form"])
+        for tool in (T.SELECT, T.FIELD_TEXT, T.FIELD_CHECK, T.FIELD_RADIO, T.FIELD_COMBO, T.FIELD_LIST,
+                     T.FIELD_SIGNATURE):
+            label, ico, helptext = T.TOOLS[tool]
+            b = QToolButton()
+            icons.bind(b, ico)
+            b.setCheckable(True)
+            b.setToolTip(f"{label}: {helptext}")
+            b.setAutoRaise(True)
+            b.clicked.connect(lambda _=False, t=tool: self.set_tool(t))
+            fb.addWidget(b)
+            if tool != T.SELECT:
+                self.tool_buttons[tool] = b
+            else:
+                self._form_select_btn = b
+        fb.addSeparator()
+        for k in ("detect_fields", "clear_form", "export_form", "import_form"):
+            fb.addAction(self.act[k])
+        done = QToolButton()
+        done.setText("Done")
+        done.setToolTip("Leave Prepare form")
+        done.clicked.connect(lambda: self.act["prepare_form"].setChecked(False))
+        spacer2 = QWidget()
+        spacer2.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        fb.addWidget(spacer2)
+        fb.addWidget(done)
+        fb.hide()
+
+        # ---- Word-style text formatting (shown while adding or editing text)
+        self.addToolBarBreak()
+        self.format_bar = TextFormatBar(self)
+        self.addToolBar(self.format_bar)
+        self.format_bar.changed.connect(self._format_changed)
+        self.format_bar.font_box.set_recent(self.opt.recent_fonts())
+        self.format_bar.hide()
 
     def _stamp_menu(self) -> QMenu:
         menu = QMenu(self)
@@ -403,6 +507,66 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Custom text...", self._custom_stamp)
         return menu
+
+    def _fillsign_menu(self) -> QMenu:
+        menu = QMenu(self)
+        group = QActionGroup(menu)
+        for mode, label, ico in T.FILLSIGN_MODES:
+            act = menu.addAction(icons.icon(ico), label, lambda m=mode: self._choose_fillsign(m))
+            act.setCheckable(True)
+            act.setChecked(mode == self.opt.fillsign_mode)
+            group.addAction(act)
+        menu.addSeparator()
+        menu.addAction("Set my initials...", self._set_initials)
+        menu.addAction("Date format...", self._set_date_format)
+        return menu
+
+    def _measure_menu(self) -> QMenu:
+        menu = QMenu(self)
+        group = QActionGroup(menu)
+        for mode, label, ico in measure.MODES:
+            act = menu.addAction(icons.icon(ico), label, lambda m=mode: self._choose_measure(m))
+            act.setCheckable(True)
+            act.setChecked(mode == self.opt.measure_mode)
+            group.addAction(act)
+        menu.addSeparator()
+        menu.addAction(self.act["measure_scale"])
+        return menu
+
+    def _choose_measure(self, mode: str) -> None:
+        self.opt.set_measure_mode(mode)
+        self.set_tool(T.MEASURE)
+        tip = ("Drag from one point to another." if mode == "distance" else
+               "Click each corner, then double-click the last one.")
+        self.msg(f"Measure {mode} (scale {self.opt.measure_scale().label()}). {tip}", 8000)
+
+    def measure_scale(self) -> None:
+        dlg = dialogs.MeasureScaleDialog(self, self.opt.measure_scale())
+        if dlg.exec():
+            self.opt.set_measure_scale(dlg.scale())
+            self.msg(f"Measuring scale: {self.opt.measure_scale().label()}")
+
+    def _choose_fillsign(self, mode: str) -> None:
+        self.opt.set_fillsign_mode(mode)
+        self.set_tool(T.FILLSIGN)
+        label = next(lbl for m, lbl, _i in T.FILLSIGN_MODES if m == mode)
+        self.msg(f"Fill & Sign: {label}. Click on the page to place it.")
+
+    def _set_initials(self) -> None:
+        text, ok = QInputDialog.getText(self, "Initials", "Your initials:", text=self.opt.initials)
+        if ok and text.strip():
+            self.settings.set("initials", text.strip()[:12])
+
+    def _set_date_format(self) -> None:
+        import datetime as _dt
+        formats = ["%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y", "%b %d, %Y", "%d %B %Y"]
+        today = _dt.date.today()
+        labels = [today.strftime(f) for f in formats]
+        cur = self.settings.get("date_format") or formats[0]
+        idx = formats.index(cur) if cur in formats else 0
+        choice, ok = QInputDialog.getItem(self, "Date format", "Dates look like:", labels, idx, False)
+        if ok and choice in labels:
+            self.settings.set("date_format", formats[labels.index(choice)])
 
     def _choose_stamp(self, name: str) -> None:
         self.opt.set_stamp(name)
@@ -445,6 +609,7 @@ class MainWindow(QMainWindow):
             a.setEnabled(is_doc)
         self.export_menu.setEnabled(is_doc)
         self.tools_tb.setVisible(is_doc)
+        self.form_bar.setVisible(is_doc and self.act["prepare_form"].isChecked())
         for w in self.page_widgets + [self.zoom_widget]:
             w.setVisible(is_doc)
         if not is_doc:
@@ -515,6 +680,8 @@ class MainWindow(QMainWindow):
     def _tool_changed(self, tool: str) -> None:
         for t, b in self.tool_buttons.items():
             b.setChecked(t == tool)
+        if hasattr(self, "_form_select_btn"):
+            self._form_select_btn.setChecked(tool == T.SELECT)
         if tool == T.SIGNATURE and not (self.opt.signature and os.path.exists(self.opt.signature)):
             QTimer.singleShot(0, self.manage_signatures)
         label, _ico, helptext = T.TOOLS[tool]
@@ -525,20 +692,25 @@ class MainWindow(QMainWindow):
         tool = self.opt.tool
         tab = self.tab()
         sa = tab.canvas.sel_annot if tab else None
-        if tool == T.SELECT and sa:
+        if tool == T.SELECT and sa and sa.get("widget"):
+            vis = {"color": False, "fill": False, "width": False, "opacity": False, "font": False}
+        elif tool == T.SELECT and sa:
             stroke = (sa.get("colors") or {}).get("stroke") or (sa.get("colors") or {}).get("fill")
-            if sa["type"] == fitz.PDF_ANNOT_FREE_TEXT:
+            is_text = sa["type"] == fitz.PDF_ANNOT_FREE_TEXT
+            if is_text and not sa.get("rich"):
                 try:
                     page = tab.pdf.page(sa["pno"])
                     _size, col = annots.freetext_style(tab.pdf.doc, page.load_annot(sa["xref"]))
                     stroke = col
                 except Exception:
                     pass
-            show_color = sa["type"] not in (fitz.PDF_ANNOT_STAMP, fitz.PDF_ANNOT_REDACT)
+            show_color = (sa["type"] not in (fitz.PDF_ANNOT_STAMP, fitz.PDF_ANNOT_REDACT) and not sa.get("kind")
+                          and not is_text) or sa.get("kind") in annots.MARK_KINDS
             if stroke:
                 self.color_btn.set_color(rgb_to_hex(stroke))
             show_width = sa["type"] in (fitz.PDF_ANNOT_SQUARE, fitz.PDF_ANNOT_CIRCLE, fitz.PDF_ANNOT_LINE,
-                                        fitz.PDF_ANNOT_INK, fitz.PDF_ANNOT_POLYGON, fitz.PDF_ANNOT_POLY_LINE)
+                                        fitz.PDF_ANNOT_INK, fitz.PDF_ANNOT_POLYGON, fitz.PDF_ANNOT_POLY_LINE) \
+                and not sa.get("kind")
             if show_width:
                 self.width_box.blockSignals(True)
                 self.width_box.setValue(float((sa.get("border") or {}).get("width") or 1))
@@ -547,11 +719,24 @@ class MainWindow(QMainWindow):
             op = sa.get("opacity")
             self.opacity_box.setValue(int((op if op is not None and op >= 0 else 1.0) * 100))
             self.opacity_box.blockSignals(False)
-            vis = {"color": show_color, "fill": False, "width": show_width, "opacity": True, "font": False}
+            show_fill = bool(sa.get("rich"))
+            if show_fill:
+                fill = (sa.get("colors") or {}).get("fill")
+                self.fill_check.blockSignals(True)
+                self.fill_check.setChecked(bool(fill))
+                self.fill_check.blockSignals(False)
+                if fill:
+                    self.fill_btn.set_color(rgb_to_hex(fill))
+            vis = {"color": show_color, "fill": show_fill, "width": show_width,
+                   "opacity": not is_text or bool(sa.get("rich")), "font": False}
         else:
             self.color_btn.set_color(self.opt.color_hex(tool))
             vis = {"color": tool in T.COLOR_TOOLS, "fill": tool in T.FILL_TOOLS, "width": tool in T.WIDTH_TOOLS,
                    "opacity": tool in T.OPACITY_TOOLS, "font": tool in T.FONT_TOOLS}
+            self.fill_check.blockSignals(True)
+            self.fill_check.setChecked(self.opt.fill)
+            self.fill_check.blockSignals(False)
+            self.fill_btn.set_color(self.opt.fill_hex)
             self.width_box.blockSignals(True)
             self.width_box.setValue(self.opt.width)
             self.width_box.blockSignals(False)
@@ -561,15 +746,107 @@ class MainWindow(QMainWindow):
         self.w_color.setVisible(vis["color"])
         self.w_fill.setVisible(vis["fill"])
         self.w_fill_color.setVisible(vis["fill"])
-        self.fill_btn.setEnabled(self.opt.fill)
+        self.fill_btn.setEnabled(self.fill_check.isChecked())
         self.w_width.setVisible(vis["width"])
         self.w_opacity.setVisible(vis["opacity"])
-        self.w_font.setVisible(vis["font"])
+        self._sync_format_bar()
         self._update_history()
+
+    def _sync_format_bar(self) -> None:
+        """Show the text formatting toolbar while text is being added, edited or is selected."""
+        tab = self.tab()
+        bar = self.format_bar
+        if tab is None:
+            bar.hide()
+            return
+        canvas = tab.canvas
+        ed = canvas.editor if isinstance(canvas.editor, RichEditor) else None
+        sa = canvas.sel_annot
+        tool = self.opt.tool
+        if ed is not None:
+            bar.set_rich(not ed.plain)
+            bar.set_state(ed.state())
+            bar.show()
+        elif tool == T.SELECT and sa and sa["type"] == fitz.PDF_ANNOT_FREE_TEXT \
+                and (sa.get("info") or {}).get("subject") != "Stamp":
+            box = sa.get("box")
+            if box is not None:
+                first = box.first_run()
+                para = box.paras[0] if box.paras else None
+                bar.set_state({"font": first.font, "size": first.size, "bold": box.all_have("bold"),
+                               "italic": box.all_have("italic"), "underline": box.all_have("underline"),
+                               "strike": box.all_have("strike"), "color": first.color, "highlight": first.highlight,
+                               "valign": first.valign, "align": para.align if para else "left",
+                               "list": para.list if para else "", "spacing": para.spacing if para else 1.0})
+            else:
+                size, col = 12.0, (0, 0, 0)
+                try:
+                    page = tab.pdf.page(sa["pno"])
+                    size, col = annots.freetext_style(tab.pdf.doc, page.load_annot(sa["xref"]))
+                except Exception:
+                    pass
+                bar.set_state({"font": "Helvetica", "size": size, "color": rgb_to_hex(col)})
+            bar.set_rich(True)
+            bar.show()
+        elif tool == T.TEXTBOX or (tool == T.FILLSIGN and self.opt.fillsign_mode == "text"):
+            # shown as soon as the tool is picked, so the page doesn't jump down on the first click
+            bar.set_rich(True)
+            bar.set_state(self.opt.text_style())
+            bar.show()
+        elif tool == T.EDIT_TEXT:
+            bar.set_rich(True)
+            bar.set_state({})
+            bar.show()
+        else:
+            bar.hide()
+
+    def _rich_editor_changed(self, ed) -> None:
+        if ed is not None:
+            ed.format_changed.connect(self.format_bar.set_state)
+        self._sync_tool_widgets()
+
+    def _format_changed(self, change: dict) -> None:
+        tab = self.tab()
+        if "font" in change:
+            self.opt.add_recent_font(change["font"])
+            self.format_bar.font_box.set_recent(self.opt.recent_fonts())
+        if tab is None:
+            return
+        canvas = tab.canvas
+        if isinstance(canvas.editor, RichEditor):
+            canvas.editor.apply(change)
+            return
+        if jobs.busy():
+            return
+        sa = canvas.sel_annot
+        if self.opt.tool == T.SELECT and sa and sa["type"] == fitz.PDF_ANNOT_FREE_TEXT:
+            canvas.format_selected(change)
+            return
+        if self.opt.tool == T.TEXTBOX:
+            self.opt.set_text_style(change)
+        elif self.opt.tool == T.EDIT_TEXT:
+            self.msg("Click on the text you want to change first, then pick the formatting.")
+
+    def _fill_toggled(self, on: bool) -> None:
+        tab = self.tab()
+        if tab and self.opt.tool == T.SELECT and tab.canvas.sel_annot and tab.canvas.sel_annot.get("rich"):
+            tab.canvas.restyle_selected(fill=hex_to_rgb(self.fill_btn.color()) if on else None)
+        else:
+            self.opt.set_fill(on)
+
+    def _fill_color_picked(self, color: str) -> None:
+        tab = self.tab()
+        if tab and self.opt.tool == T.SELECT and tab.canvas.sel_annot and tab.canvas.sel_annot.get("rich"):
+            tab.canvas.restyle_selected(fill=hex_to_rgb(color))
+        else:
+            self.opt.set_fill_color(color)
 
     def _annot_selected(self, info) -> None:
         tab = self.tab()
-        if info and tab:
+        if info and tab and info.get("widget"):
+            self.tool_hint.setText(f"{info['name']} \u201c{info.get('field_name', '')}\u201d selected. Drag to move, "
+                                   "Delete to remove, double-click for options.")
+        elif info and tab:
             self.tool_hint.setText(f"{info['name']} selected. Drag to move, Delete to remove"
                                    + (", double-click to edit" if info["type"] in (fitz.PDF_ANNOT_FREE_TEXT,
                                                                                    fitz.PDF_ANNOT_TEXT) else "") + ".")
@@ -728,10 +1005,22 @@ class MainWindow(QMainWindow):
         c.tool_reset_requested.connect(lambda: self.set_tool(T.SELECT))
         c.open_file_requested.connect(self.open_path)
         c.signature_needed.connect(self.manage_signatures)
+        c.format_bar = self.format_bar
+        c.digital_sign_requested.connect(lambda pno, rect, field, t=tab: self.tab() is t and
+                                         self.sign_with_digital_id(pno, rect, field))
+        tab.banner_button.clicked.connect(self.check_signatures)
+        c.form_edit = self.act["prepare_form"].isChecked()
+        c.rich_editor_changed.connect(lambda ed, t=tab: self.tab() is t and self._rich_editor_changed(ed))
         c.annot_selected.connect(lambda info, t=tab: self.tab() is t and self._annot_selected(info))
         c.selection_changed.connect(lambda _s: None)
         tab.status_changed.connect(lambda t=tab: self.tab() is t and self._update_status())
         tab.title_changed.connect(self._update_title)
+        tab.comments.export_requested.connect(self.export_comments)
+        tab.bookmarks.auto_requested.connect(self.auto_bookmarks)
+        tab.attachments.add_requested.connect(self.attach_file)
+        tab.attachments.save_requested.connect(self.save_attachment)
+        tab.attachments.delete_requested.connect(self.delete_attachment)
+        tab.attachments.open_pdf_requested.connect(self.open_attachment)
         pdf.history_changed.connect(lambda t=tab: self.tab() is t and self._update_history())
         idx = self.tabs.addTab(tab, icons.icon("file-text"), tab.display_title())
         close = QToolButton()
@@ -840,6 +1129,21 @@ class MainWindow(QMainWindow):
     def _save_tab(self, tab: DocumentTab, as_new: bool = False) -> bool:
         tab.canvas.commit_editor()
         pdf = tab.pdf
+        problem = self._signature_problem(pdf) if pdf.dirty else ""
+        if problem:
+            box = QMessageBox(QMessageBox.Icon.Warning, "Digital signatures",
+                              f"This PDF is digitally signed. {problem}\n\nSave it as a new file to keep the "
+                              "signed original?", parent=self)
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            new_btn = box.addButton("Save as new file", QMessageBox.ButtonRole.AcceptRole)
+            anyway = box.addButton("Save anyway", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(new_btn)
+            box.exec()
+            if box.clickedButton() is new_btn:
+                as_new = True
+            elif box.clickedButton() is not anyway:
+                return False
         target = pdf.path
         if as_new or pdf.is_new or not target:
             suggestion = pdf.suggested_path or os.path.join(self.settings.get("last_dir"), pdf.title)
@@ -870,9 +1174,12 @@ class MainWindow(QMainWindow):
 
     @_with_tab
     def save_copy(self, tab: DocumentTab) -> None:
-        base = tab.pdf.path or tab.pdf.suggested_path or os.path.join(self.settings.get("last_dir"), tab.pdf.title)
-        target, _ = QFileDialog.getSaveFileName(self, "Save a copy", str(Path(base).with_name(Path(base).stem + " copy.pdf")),
-                                                "PDF files (*.pdf)")
+        base = self.doc_base(tab.pdf)
+        problem = self._signature_problem(tab.pdf)
+        if problem and ui.question(self, "Save a copy", f"This PDF is digitally signed. {problem}\n\nSave the copy "
+                                                        "anyway?", default=ui.No) != ui.Yes:
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "Save a copy", f"{base} copy.pdf", "PDF files (*.pdf)")
         if target:
             if not target.lower().endswith(".pdf"):
                 target += ".pdf"
@@ -881,6 +1188,26 @@ class MainWindow(QMainWindow):
                 self.msg(f"Saved a copy as {Path(target).name}")
             except Exception as exc:
                 ui.warning(self, "Save a copy", str(exc))
+
+    def _signature_problem(self, pdf: PdfDocument) -> str:
+        """Why saving the document as it is now would make its digital signatures show as invalid,
+        in plain words ("" when it wouldn't)."""
+        if not pdf.signed_bytes:
+            return ""
+        if pdf.will_break_signatures():
+            return ("One of the changes you made (such as reducing the file size, recognizing text or converting "
+                    "colors) rewrites the whole file, so the signatures will no longer be valid.")
+        from pdfdesk import digitalid
+        if not digitalid.available() or not pdf.base_bytes:
+            return ""
+        from pdfdesk import sigdiff
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            return sigdiff.update_problem(pdf.base_bytes, pdf.save_bytes(), pdf.password)
+        except Exception:
+            return ""
+        finally:
+            QApplication.restoreOverrideCursor()
 
     def _confirm_close(self, tab: DocumentTab) -> bool:
         tab.canvas.commit_editor()
@@ -961,7 +1288,8 @@ class MainWindow(QMainWindow):
 
     def copy(self) -> None:
         focus = QApplication.focusWidget()
-        if isinstance(focus, QLineEdit) or (focus is not None and focus.inherits("QPlainTextEdit")):
+        if isinstance(focus, QLineEdit) or (focus is not None and (focus.inherits("QPlainTextEdit")
+                                                                     or focus.inherits("QTextEdit"))):
             focus.copy()
             return
         tab = self.tab()
@@ -1033,11 +1361,15 @@ class MainWindow(QMainWindow):
         self.settings.set("theme", mode)
         theme.apply_theme(QApplication.instance(), mode)
         icons.refresh_all()
+        if hasattr(self, "format_bar"):
+            self.format_bar.color._refresh()
+            self.format_bar.highlight._refresh()
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             self.tabs.setTabIcon(i, icons.icon("house" if w is self.home else "file-text"))
             if isinstance(w, DocumentTab):
-                for k, ico in enumerate(("gallery-vertical", "bookmark", "message-square-text", "search")):
+                for k, ico in enumerate(("gallery-vertical", "bookmark", "message-square-text", "paperclip",
+                                         "layers", "search")):
                     w.side_tabs.setTabIcon(k, icons.icon(ico))
                 w.canvas.update()
         self.home.reload()
@@ -1295,6 +1627,573 @@ class MainWindow(QMainWindow):
         with tab.pdf.edit("Remove hidden information", structure=True):
             pdfops.remove_hidden_data(tab.pdf.doc)
         self.msg("Hidden information removed. Save to keep the change.", 8000)
+
+    # ================================================================== document features
+    @_with_tab
+    def page_labels(self, tab: DocumentTab) -> None:
+        dlg = dialogs.PageLabelsDialog(self, tab.pdf.page_count, docfeatures.get_labels(tab.pdf.doc))
+        if dlg.exec():
+            try:
+                with tab.pdf.edit("Page labels", structure=True):
+                    docfeatures.set_labels(tab.pdf.doc, dlg.rules())
+            except Exception as exc:
+                ui.warning(self, "Page labels", str(exc))
+
+    @_with_tab
+    def background(self, tab: DocumentTab) -> None:
+        dlg = dialogs.BackgroundDialog(self, tab.pdf, tab.canvas.current_page)
+        if dlg.exec():
+            try:
+                with tab.pdf.edit("Add background", pages=dlg._pages):
+                    dlg.apply(tab.pdf.doc, dlg._pages)
+            except Exception as exc:
+                ui.warning(self, "Background", str(exc))
+
+    @_with_tab
+    def page_size(self, tab: DocumentTab) -> None:
+        dlg = dialogs.PageSizeDialog(self, tab.pdf, tab.canvas.current_page)
+        if dlg.exec():
+            w, h = dlg.size_pt()
+            try:
+                with tab.pdf.edit("Change page size", structure=True):
+                    docfeatures.resize_pages(tab.pdf.doc, dlg._pages, w, h, dlg.mode_key())
+            except Exception as exc:
+                ui.warning(self, "Page size", str(exc))
+
+    @_with_tab
+    def remove_blank_pages(self, tab: DocumentTab) -> None:
+        def done(blank: list[int]) -> None:
+            if not blank:
+                ui.information(self, "Remove blank pages", "No blank pages were found.")
+                return
+            if len(blank) >= tab.pdf.page_count:
+                ui.information(self, "Remove blank pages", "Every page looks blank, so nothing was removed.")
+                return
+            if ui.question(self, "Remove blank pages",
+                           f"Found {len(blank)} blank page(s): {pdfops.format_page_list(blank)}.\n\nRemove them?") \
+                    != ui.Yes:
+                return
+            with tab.pdf.edit("Remove blank pages", structure=True):
+                pdfops.delete_pages(tab.pdf.doc, blank)
+            self.msg(f"Removed {len(blank)} blank page(s).")
+
+        jobs.run_job(self, "Looking for blank pages", docfeatures.find_blank_pages, tab.pdf.doc.tobytes(),
+                     tab.pdf.password, on_done=done)
+
+    @_with_tab
+    def print_layout(self, tab: DocumentTab, booklet: bool = False) -> None:
+        dlg = dialogs.PrintLayoutDialog(self, booklet)
+        if not dlg.exec():
+            return
+        p = dlg.params()
+        base = self.doc_base(tab.pdf)
+        stem = base.name
+        name = f"{stem} - booklet.pdf" if p["kind"] == "booklet" else f"{stem} - {p['kind']} per sheet.pdf"
+        folder = str(base.parent)
+
+        def done(data: bytes) -> None:
+            self.add_document(PdfDocument.from_bytes(data, name, os.path.join(folder, name)))
+            self.msg("Made a new PDF for printing. Save it to keep it.", 8000)
+
+        data = tab.pdf.plain_bytes()
+        if p["kind"] == "booklet":
+            jobs.run_job(self, "Making a booklet", docfeatures.booklet_bytes, data, p["paper"], on_done=done)
+        else:
+            jobs.run_job(self, "Arranging pages", docfeatures.nup_bytes, data, p["kind"], p["paper"],
+                         borders=p["borders"], on_done=done)
+
+    @_with_tab
+    def grayscale(self, tab: DocumentTab) -> None:
+        if ui.question(self, "Convert to grayscale", "Turn every color in this PDF (text, drawings and pictures) "
+                                                     "into shades of gray?") != ui.Yes:
+            return
+
+        def done(data: bytes) -> None:
+            tab.pdf.replace_with_bytes(data, "Convert to grayscale")
+            self.msg("Converted to grayscale. Save to keep the change.", 8000)
+
+        jobs.run_job(self, "Converting to grayscale", docfeatures.grayscale_bytes, tab.pdf.doc.tobytes(),
+                     tab.pdf.password, on_done=done)
+
+    @_with_tab
+    def extract_images(self, tab: DocumentTab) -> None:
+        base = tab.pdf.path or tab.pdf.suggested_path or ""
+        folder = QFileDialog.getExistingDirectory(self, "Save the pictures in", os.path.dirname(base) or
+                                                  self.settings.get("last_dir"))
+        if not folder:
+            return
+
+        def done(paths: list[str]) -> None:
+            if not paths:
+                ui.information(self, "Save all pictures", "This PDF has no pictures to save.")
+                return
+            box = QMessageBox(QMessageBox.Icon.Information, "Save all pictures",
+                              f"Saved {len(paths)} picture(s) in\n{folder}", parent=self)
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            open_btn = box.addButton("Show folder", QMessageBox.ButtonRole.ActionRole)
+            box.addButton(QMessageBox.StandardButton.Ok)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+        jobs.run_job(self, "Saving pictures", docfeatures.extract_images, tab.pdf.plain_bytes(), folder,
+                     self.doc_base(tab.pdf).name, on_done=done)
+
+    @_with_tab
+    def export_comments(self, tab: DocumentTab) -> None:
+        base = self.doc_base(tab.pdf)
+        path, chosen = QFileDialog.getSaveFileName(self, "Comment summary", str(base) + " comments.md",
+                                                   "Markdown (*.md);;CSV for spreadsheets (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith((".md", ".csv")):
+            path += ".csv" if chosen.startswith("CSV") else ".md"
+        try:
+            count = docfeatures.export_comments(tab.pdf.doc, path, tab.pdf.title)
+        except Exception as exc:
+            ui.warning(self, "Comment summary", str(exc))
+            return
+        self.msg(f"Saved {count} comment(s) to {Path(path).name}")
+
+    @_with_tab
+    def attach_file(self, tab: DocumentTab) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Attach a file", self.settings.get("last_dir"), "All files (*)")
+        if not path:
+            return
+        try:
+            with tab.pdf.edit("Attach file", pages=[]):
+                name = docfeatures.add_attachment(tab.pdf.doc, path)
+        except Exception as exc:
+            ui.warning(self, "Attach a file", str(exc))
+            return
+        tab.toggle_sidebar(True)
+        self.act["sidebar"].setChecked(True)
+        tab.side_tabs.setCurrentWidget(tab.attachments)
+        tab.attachments.reload()
+        self.msg(f"Attached {name}. Save the PDF to keep it.")
+
+    def save_attachment(self, item: dict) -> None:
+        tab = self.tab()
+        if tab is None or jobs.busy():
+            return
+        from pdfdesk import safety
+        name = safety.safe_filename_part(item["name"]) or "attachment"
+        path, _ = QFileDialog.getSaveFileName(self, "Save attachment", os.path.join(self.settings.get("last_dir"), name),
+                                              "All files (*)")
+        if not path:
+            return
+        try:
+            data = docfeatures.attachment_bytes(tab.pdf.doc, item)
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception as exc:
+            ui.warning(self, "Save attachment", str(exc))
+            return
+        self.msg(f"Saved {Path(path).name}. PDF Desk never opens attached files for you; check them before use.")
+
+    def delete_attachment(self, item: dict) -> None:
+        tab = self.tab()
+        if tab is None or jobs.busy():
+            return
+        if ui.question(self, "Remove attachment", f"Remove the attached file \u201c{item['name']}\u201d from this PDF?") \
+                != ui.Yes:
+            return
+        try:
+            with tab.pdf.edit("Remove attachment", pages=[] if item["page"] is None else [item["page"]]):
+                docfeatures.delete_attachment(tab.pdf.doc, item)
+        except Exception as exc:
+            ui.warning(self, "Remove attachment", str(exc))
+            return
+        tab.attachments.reload()
+
+    def open_attachment(self, item: dict) -> None:
+        """Attached PDFs open in a new tab (from memory). Other kinds of files are never opened."""
+        tab = self.tab()
+        if tab is None or jobs.busy():
+            return
+        try:
+            data = docfeatures.attachment_bytes(tab.pdf.doc, item)
+        except Exception as exc:
+            ui.warning(self, "Open attachment", str(exc))
+            return
+        if not data.lstrip()[:5].startswith(b"%PDF") and b"%PDF" not in data[:1024]:
+            ui.information(self, "Open attachment", "That attachment isn't a PDF, so it can only be saved.")
+            return
+        try:
+            from pdfdesk import safety
+            title = safety.safe_filename_part(Path(item["name"]).name) or "attachment"
+            if not title.lower().endswith(".pdf"):
+                title += ".pdf"
+            pdf = PdfDocument.from_bytes(data, title)
+        except Exception as exc:
+            ui.warning(self, "Open attachment", f"The attached PDF couldn't be opened:\n\n{exc}")
+            return
+        self.add_document(pdf)
+
+    # ================================================================== reading & comparing
+    @_with_tab
+    def present(self, tab: DocumentTab) -> None:
+        from pdfdesk.present import PresentationWindow
+        self._presentation = PresentationWindow(tab.pdf, tab.canvas.current_page, bool(self.settings.get("night_mode")))
+        self._presentation.destroyed.connect(lambda *_: setattr(self, "_presentation", None))
+        self._presentation.start()
+
+    @_with_tab
+    def reader_view(self, tab: DocumentTab) -> None:
+        from pdfdesk import reader
+
+        def done(body: str) -> None:
+            dlg = reader.ReaderView(self, tab.pdf.title, body)
+            dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dlg.show()
+            QTimer.singleShot(0, lambda: dlg.view.scrollToAnchor(f"p{tab.canvas.current_page + 1}"))
+
+        jobs.run_job(self, "Preparing reader view", lambda data, pw, progress=None:
+                     reader.document_html(pdfops.open_bytes(data, pw), progress),
+                     tab.pdf.doc.tobytes(), tab.pdf.password, on_done=done)
+
+    @_with_tab
+    def auto_bookmarks(self, tab: DocumentTab) -> None:
+        jobs.run_job(self, "Looking for headings", docfeatures.headings_toc_bytes, tab.pdf.doc.tobytes(),
+                     tab.pdf.password, on_done=lambda toc: self._apply_headings(tab, toc))
+
+    def _apply_headings(self, tab: DocumentTab, toc: list) -> None:
+        if tab not in self.doc_tabs():
+            return
+        if not toc:
+            ui.information(self, "Bookmarks from headings", "No headings were found. They are found by their size: "
+                                                            "text clearly bigger than the body text.")
+            return
+        if tab.pdf.doc.get_toc() and ui.question(
+                self, "Bookmarks from headings",
+                f"Found {len(toc)} heading(s). Replace the bookmarks this PDF already has?") != ui.Yes:
+            return
+        with tab.pdf.edit("Bookmarks from headings", structure=True):
+            tab.pdf.doc.set_toc(toc)
+        tab.toggle_sidebar(True)
+        self.act["sidebar"].setChecked(True)
+        tab.side_tabs.setCurrentWidget(tab.bookmarks)
+        self.msg(f"Made {len(toc)} bookmark(s) from the headings.")
+
+    @_with_tab
+    def compare_files(self, tab: DocumentTab) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, f"Compare {tab.pdf.title} with", self.settings.get("last_dir"),
+                                              "PDF files (*.pdf)")
+        if not path:
+            return
+        try:
+            other = Path(path).read_bytes()
+            probe = fitz.open("pdf", other)
+            needs = probe.needs_pass
+            probe.close()
+        except Exception as exc:
+            ui.warning(self, "Compare files", f"That file couldn't be read as a PDF:\n\n{exc}")
+            return
+        other_pw = None
+        if needs:
+            other_pw, ok = QInputDialog.getText(self, "Password", f"This file needs a password:\n{Path(path).name}",
+                                                QLineEdit.EchoMode.Password)
+            if not ok:
+                return
+        new_name, old_name = tab.pdf.title, Path(path).name
+        mine = tab.pdf.plain_bytes()
+
+        def done(result) -> None:
+            data, info = result
+            name = f"Compare - {Path(old_name).stem} vs {Path(new_name).stem}.pdf"
+            self.add_document(PdfDocument.from_bytes(data, name))
+            n = len(info["changes"])
+            self.msg(f"{n} difference(s) found. Red = only in {old_name}, green = only in {new_name}.", 12000)
+
+        # the chosen file is the "old" version, the open document the "new" one
+        jobs.run_job(self, "Comparing", compare.report_bytes, other, mine, old_name, new_name, other_pw, None,
+                     on_done=done)
+
+    def read_aloud(self, what: str) -> None:
+        tab = self.tab()
+        if tab is None or jobs.busy():
+            return
+        if not speech.available():
+            ui.information(self, "Read out loud", speech.missing_help())
+            return
+        cur = tab.canvas.current_page
+        if what == "selection":
+            text = tab.canvas.selected_text()
+            if not text.strip():
+                self.msg("Select some text first.")
+                return
+            self._reading = (tab, [cur])
+            texts = [text]
+        else:
+            pages = [cur] if what == "page" else list(range(cur, min(tab.pdf.page_count, cur + 300)))
+            texts = [tab.pdf.page(p).get_text("text", sort=True, flags=pdfops.WORD_FLAGS) for p in pages]
+            self._reading = (tab, pages)
+        self.reader.read(texts, int(self.settings.get("speech_rate") or 0))
+
+    def _reading_piece(self, idx: int) -> None:
+        tab, pages = getattr(self, "_reading", (None, []))
+        if tab is not None and 0 <= idx < len(pages) and tab in self.doc_tabs():
+            if len(pages) > 1:
+                tab.canvas.go_to_page(pages[idx])
+            self.statusBar().showMessage(f"Reading page {pages[idx] + 1} out loud. Ctrl+Shift+E stops.")
+
+    def stop_reading(self) -> None:
+        self.reader.stop()
+
+    def reading_speed(self) -> None:
+        value, ok = QInputDialog.getInt(self, "Reading speed", "Speed (-10 slow, 0 normal, 10 fast):",
+                                        int(self.settings.get("speech_rate") or 0), -10, 10)
+        if ok:
+            self.settings.set("speech_rate", value)
+
+    # ================================================================== digital IDs
+    def manage_digital_ids(self) -> None:
+        from pdfdesk import digitalid
+        if not digitalid.available():
+            ui.information(self, "Digital IDs", "Digital signatures need the pyHanko package. Run the PDF Desk "
+                                                "installer again to add it.")
+            return
+        dialogs.DigitalIdsDialog(self, self.opt.author).exec()
+
+    @_with_tab
+    def start_digital_sign(self, tab: DocumentTab) -> None:
+        from pdfdesk import digitalid
+        if not digitalid.available():
+            self.manage_digital_ids()
+            return
+        empty = [f for f in digitalid.existing_signature_fields(tab.pdf.doc) if not f["signed"]]
+        if empty:
+            f = empty[0]
+            where = f"on page {f['page'] + 1}" if f["page"] is not None else "not shown on any page"
+            name = safety.clean_text(f["name"], 80)
+            if ui.question(self, "Sign with Digital ID",
+                           f"This PDF has an empty signature field (\u201c{name}\u201d, {where}). "
+                           "Sign that field?") == ui.Yes:
+                self.sign_with_digital_id(f["page"] or 0, None, f["name"])
+                return
+        self.set_tool(T.DIGISIGN)
+        self.msg("Drag a box where your digital signature should appear.", 10000)
+
+    def sign_with_digital_id(self, pno: int, vis_rect, field: str = "") -> None:
+        from pdfdesk import digitalid
+        tab = self.tab()
+        if tab is None or jobs.busy():
+            return
+        self.set_tool(T.SELECT)
+        if not digitalid.available():
+            self.manage_digital_ids()
+            return
+        if not digitalid.list_ids():
+            if ui.question(self, "Sign with Digital ID", "You don't have a Digital ID yet. Create one now?") \
+                    != ui.Yes:
+                return
+            dialogs.DigitalIdsDialog(self, self.opt.author).exec()
+            if not digitalid.list_ids():
+                return
+        pdf = tab.pdf
+        problem = self._signature_problem(pdf) if (pdf.dirty or pdf.will_break_signatures()) else ""
+        if problem and ui.question(self, "Sign with Digital ID",
+                                   f"This PDF already has digital signatures. {problem} Signing it now will "
+                                   "show the earlier signatures as invalid in the signed copy.\n\nSign anyway?",
+                                   default=ui.No) != ui.Yes:
+            return
+        base = self.doc_base(pdf)
+        default = f"{base} (signed).pdf"
+        sig_image = self.opt.signature if self.opt.signature and os.path.exists(self.opt.signature) else ""
+        dlg = dialogs.SignDialog(self, digitalid.list_ids(), default, bool(sig_image) and vis_rect is not None
+                                 or bool(sig_image and field), self.settings.get("sign_reason") or "",
+                                 self.settings.get("sign_location") or "")
+        accepted = dlg.exec()
+        target = dlg.target.path()
+        reason = digitalid.one_line(dlg.reason.currentText(), 200)
+        location = digitalid.one_line(dlg.location.text(), 200)
+        id_path, password = dlg.id_box.currentData(), dlg.password.text()
+        with_image = dlg.with_image.isChecked()
+        dlg.password.clear()
+        dlg.deleteLater()
+        if not accepted:
+            return
+        self.settings.set("sign_reason", reason)
+        self.settings.set("sign_location", location)
+        image = Path(sig_image).read_bytes() if sig_image and with_image else None
+        try:
+            data = pdf.save_bytes()
+        except Exception as exc:
+            ui.warning(self, "Sign with Digital ID", str(exc))
+            return
+
+        def done(signed: bytes) -> None:
+            digitalid.cleanup()
+            try:
+                write_file_safely(target, signed)
+            except Exception as exc:
+                ui.warning(self, "Sign with Digital ID", f"The signed PDF couldn't be saved:\n\n{exc}")
+                return
+            same = pdf.path and os.path.normcase(os.path.abspath(pdf.path)) == os.path.normcase(os.path.abspath(target))
+            if same:
+                pdf.saved_id = pdf.state_id
+                self.close_tab(self.tabs.indexOf(tab))
+            self.open_path(target)
+            self.msg(f"Signed and saved as {Path(target).name}.", 10000)
+
+        def failed(exc) -> None:
+            digitalid.cleanup()
+            ui.warning(self, "Sign with Digital ID", str(exc))
+
+        digitalid.preload()
+        jobs.run_job(self, "Signing", digitalid.sign, data, id_path, password, page=pno, vis_rect=vis_rect,
+                     field_name=field or None, reason=reason, location=location, contact="", image=image,
+                     doc_password=pdf.password, on_done=done, on_error=failed, cancellable=False)
+
+    @_with_tab
+    def check_signatures(self, tab: DocumentTab) -> None:
+        from pdfdesk import digitalid
+        if not digitalid.available():
+            self.manage_digital_ids()
+            return
+        pdf = tab.pdf
+        try:
+            data = pdf.save_bytes()   # what you see now, including changes not saved yet
+        except Exception:
+            data = pdf.base_bytes or pdf.doc.tobytes()
+        base = self.doc_base(pdf)
+
+        def done(results: list[dict]) -> None:
+            if not results:
+                tab.set_banner_level("info", "No digital signatures were found in this PDF.")
+                ui.information(self, "Digital signatures", "This PDF has no digital signatures.")
+                return
+            levels = [digitalid.describe(r)[0] for r in results]
+            worst = "bad" if "bad" in levels else "warn" if "warn" in levels else "good"
+            summary = {"good": "All signatures are valid and the document hasn't been changed in a way that "
+                               "matters.",
+                       "warn": "The signatures are intact, but see the details (changes after signing or an "
+                               "unconfirmed identity).",
+                       "bad": "At least one signature is NOT valid. Don't rely on this document without "
+                              "checking the details."}[worst]
+            tab.set_banner_level(worst, f"{len(results)} digital signature(s). {summary}")
+            tab.banner.show()
+            dlg = dialogs.SignaturesDialog(self, results, lambda item: self._open_signed_version(
+                data, item, base, pdf.password))
+            dlg.exec()
+            trusted = dlg.trusted_any
+            dlg.deleteLater()
+            if trusted:
+                QTimer.singleShot(0, self.check_signatures)
+
+        digitalid.preload()
+        jobs.run_job(self, "Checking signatures", digitalid.validate, data, pdf.password, on_done=done)
+
+    def _open_signed_version(self, data: bytes, item: dict, base: str, password: str | None) -> None:
+        from pdfdesk import digitalid
+        version = digitalid.signed_version(data, item)
+        if version is None:
+            raise ValueError("The signed version of this signature can't be told apart from the rest of the file.")
+        field = safety.safe_filename_part(item.get("field") or "Signature", 40) or "Signature"
+        base = Path(base)
+        name = f"{base.name} (signed version, {field}).pdf"
+        pdf = PdfDocument.from_bytes(version, name, str(base.parent / name))
+        if pdf.doc.needs_pass and password:
+            pdf.doc.authenticate(password)
+            pdf.password = password
+        self.add_document(pdf)
+        self.msg("This is the document exactly as it was when the signature was made. Tools > Compare files "
+                 "shows what changed since.", 12000)
+
+    # ================================================================== forms
+    def toggle_prepare_form(self, on: bool) -> None:
+        for tab in self.doc_tabs():
+            tab.canvas.set_form_edit(on)
+        self.form_bar.setVisible(on and self.tab() is not None)
+        if on:
+            self.set_tool(T.SELECT)
+            self.msg("Prepare form: pick a field type and drag on the page. Drag fields to move them, "
+                     "double-click for their options.", 10000)
+        elif self.opt.tool in T.FIELD_TOOLS:
+            self.set_tool(T.SELECT)
+
+    @_with_tab
+    def detect_fields(self, tab: DocumentTab) -> None:
+        pdf = tab.pdf
+        pages = range(pdf.page_count) if pdf.page_count <= 60 else [tab.canvas.current_page]
+        found = []
+        for pno in pages:
+            try:
+                found += [(pno, k, r, n) for k, r, n in forms.detect_fields(pdf.page(pno))]
+            except Exception:
+                continue
+        if not found:
+            ui.information(self, "Find form fields", "No blank lines, underscores or boxes that look like form "
+                                                     "fields were found." + ("" if pdf.page_count <= 60 else
+                                                                            " (Only the current page was checked.)"))
+            return
+        dlg = dialogs.DetectedFieldsDialog(self, found)
+        if not dlg.exec():
+            return
+        chosen = dlg.chosen()
+        if not chosen:
+            return
+        by_page: dict[int, list] = {}
+        for pno, kind, rect, name in chosen:
+            by_page.setdefault(pno, []).append((kind, rect, name))
+        try:
+            with pdf.edit("Add form fields", pages=sorted(by_page)):
+                total = sum(forms.add_detected(pdf.page(pno), items) for pno, items in by_page.items())
+        except Exception as exc:
+            ui.warning(self, "Find form fields", str(exc))
+            return
+        if not self.act["prepare_form"].isChecked():
+            self.act["prepare_form"].setChecked(True)
+        self.msg(f"Added {total} form field(s). Double-click a field to rename it or change its options.", 10000)
+
+    @_with_tab
+    def clear_form(self, tab: DocumentTab) -> None:
+        if ui.question(self, "Clear form", "Empty every field and untick every box in this form?") != ui.Yes:
+            return
+        with tab.pdf.edit("Clear form"):
+            count = forms.reset_form(tab.pdf.doc)
+        self.msg(f"Cleared {count} field(s).")
+
+    @_with_tab
+    def export_form_data(self, tab: DocumentTab) -> None:
+        base = self.doc_base(tab.pdf)
+        path, chosen = QFileDialog.getSaveFileName(self, "Export form data", str(base) + " data.json",
+                                                   "JSON (*.json);;CSV for spreadsheets (*.csv);;XFDF for Acrobat (*.xfdf)")
+        if not path:
+            return
+        ext = {"CSV": ".csv", "XFDF": ".xfdf"}.get(chosen.split()[0], ".json")
+        if not path.lower().endswith((".json", ".csv", ".xfdf")):
+            path += ext
+        try:
+            count = forms.export_data(tab.pdf.doc, path, Path(tab.pdf.path or tab.pdf.title).name)
+        except Exception as exc:
+            ui.warning(self, "Export form data", str(exc))
+            return
+        self.msg(f"Saved {count} field value(s) to {Path(path).name}")
+
+    @_with_tab
+    def import_form_data(self, tab: DocumentTab) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import form data", self.settings.get("last_dir"),
+                                              "Form data (*.json *.csv *.xfdf)")
+        if not path:
+            return
+        try:
+            values = forms.read_data(path)
+        except Exception as exc:
+            ui.warning(self, "Import form data", f"That file couldn't be read as form data:\n\n{exc}")
+            return
+        try:
+            with tab.pdf.edit("Import form data"):
+                count = forms.apply_values(tab.pdf.doc, values)
+                if not count:
+                    raise _NoChange()
+        except _NoChange:
+            ui.information(self, "Import form data", "None of the names in that file match a field in this form.")
+            return
+        except Exception as exc:
+            ui.warning(self, "Import form data", str(exc))
+            return
+        self.msg(f"Filled in {count} field(s) from {Path(path).name}.")
 
     def manage_signatures(self) -> None:
         dlg = SignatureDialog(self, self.opt.signature)

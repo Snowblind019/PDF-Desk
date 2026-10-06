@@ -86,6 +86,8 @@ DEFAULTS = {
         "ellipse": "#e5383b",
         "line": "#e5383b",
         "arrow": "#e5383b",
+        "fillsign": "#1d1d1f",
+        "measure": "#d33f49",
     },
     "stroke_width": 2.0,
     "opacity": 1.0,
@@ -94,6 +96,12 @@ DEFAULTS = {
     "fill_color": "#ffffff",
     "stamp": "Approved",
     "signature": "",
+    "fillsign_mode": "text",
+    "initials": "",
+    "date_format": "%m/%d/%Y",
+    "measure_mode": "distance",
+    "measure_scale": {"page_value": 1, "page_unit": "in", "real_value": 1, "real_unit": "in", "decimals": 2},
+    "speech_rate": 0,
 }
 
 

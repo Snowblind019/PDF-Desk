@@ -15,7 +15,7 @@ from pdfdesk.canvas import DocumentView
 from pdfdesk.dialogs import InsertPagesDialog, PagesDialog, SplitDialog
 from pdfdesk.document import PdfDocument
 from pdfdesk.organizer import PageOrganizer
-from pdfdesk.sidebar import BookmarkPanel, CommentsPanel, SearchPanel, ThumbList
+from pdfdesk.sidebar import AttachmentsPanel, BookmarkPanel, CommentsPanel, LayersPanel, SearchPanel, ThumbList
 from pdfdesk.tools import ToolOptions
 
 
@@ -24,6 +24,7 @@ class FindBar(QFrame):
     next_requested = Signal()
     prev_requested = Signal()
     closed = Signal()
+    highlight_all = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +45,11 @@ class FindBar(QFrame):
         self.count.setObjectName("muted")
         lay.addWidget(self.count)
         lay.addStretch(1)
+        mark = QToolButton()
+        icons.bind(mark, "highlighter")
+        mark.setToolTip("Highlight every match")
+        mark.clicked.connect(self.highlight_all.emit)
+        lay.addWidget(mark)
         for name, tip, sig in (("chevron-up", "Previous match (Shift+F3)", self.prev_requested),
                                ("chevron-down", "Next match (F3)", self.next_requested)):
             b = QToolButton()
@@ -128,9 +134,13 @@ class DocumentTab(QWidget):
         self.thumbs = ThumbList(pdf, box=112)
         self.bookmarks = BookmarkPanel(pdf, lambda: self.canvas.current_page)
         self.comments = CommentsPanel(pdf)
+        self.attachments = AttachmentsPanel(pdf)
+        self.layers = LayersPanel(pdf)
         self.search_panel = SearchPanel()
         for widget, ico, tip in ((self.thumbs, "gallery-vertical", "Pages"), (self.bookmarks, "bookmark", "Bookmarks"),
-                                 (self.comments, "message-square-text", "Comments"), (self.search_panel, "search", "Search results")):
+                                 (self.comments, "message-square-text", "Comments"),
+                                 (self.attachments, "paperclip", "Attached files"), (self.layers, "layers", "Layers"),
+                                 (self.search_panel, "search", "Search results")):
             idx = self.side_tabs.addTab(widget, "")
             self.side_tabs.setTabIcon(idx, icons.icon(ico))
             self.side_tabs.setTabToolTip(idx, tip)
@@ -143,6 +153,24 @@ class DocumentTab(QWidget):
         ml = QVBoxLayout(main)
         ml.setContentsMargins(0, 0, 0, 0)
         ml.setSpacing(0)
+        self.banner = QFrame()
+        self.banner.setObjectName("sigBanner")
+        bl = QHBoxLayout(self.banner)
+        bl.setContentsMargins(12, 6, 10, 6)
+        self.banner_icon = QLabel()
+        self.banner_icon.setPixmap(icons.icon("file-check").pixmap(18, 18))
+        bl.addWidget(self.banner_icon)
+        self.banner_text = QLabel("This PDF contains digital signatures. Check them to see who signed it and "
+                                  "whether it changed afterwards.")
+        self.banner_text.setTextFormat(Qt.TextFormat.PlainText)
+        self.banner_text.setWordWrap(True)
+        bl.addWidget(self.banner_text, 1)
+        self.banner_button = QToolButton()
+        self.banner_button.setText("Check signatures")
+        bl.addWidget(self.banner_button)
+        self.banner.setVisible(bool(pdf.signed_bytes))
+        self.set_banner_level("info")
+        ml.addWidget(self.banner)
         self.findbar = FindBar()
         self.findbar.hide()
         ml.addWidget(self.findbar)
@@ -173,6 +201,7 @@ class DocumentTab(QWidget):
         self.findbar.next_requested.connect(lambda: self.step_hit(1))
         self.findbar.prev_requested.connect(lambda: self.step_hit(-1))
         self.findbar.closed.connect(self._search_closed)
+        self.findbar.highlight_all.connect(self.highlight_all_hits)
         pdf.dirty_changed.connect(lambda _d: self.title_changed.emit())
         pdf.saved.connect(lambda _p: self.title_changed.emit())
         pdf.structure_changed.connect(self._structure_changed)
@@ -183,6 +212,17 @@ class DocumentTab(QWidget):
         self._search_state: dict | None = None
 
     # ------------------------------------------------------------------ basics
+    def set_banner_level(self, level: str, text: str | None = None) -> None:
+        colors = {"info": ("#e8f0fe", "#1f4e9c"), "good": ("#e6f4ea", "#1e6b34"), "warn": ("#fff4d6", "#7a5300"),
+                  "bad": ("#fde7e9", "#9b1c26")}
+        bg, fg = colors.get(level, colors["info"])
+        icon = {"good": "badge-check", "warn": "triangle-alert", "bad": "octagon-x"}.get(level, "file-check")
+        self.banner_icon.setPixmap(icons.icon(icon).pixmap(18, 18))
+        self.banner.setStyleSheet(f"QFrame#sigBanner {{ background: {bg}; border-bottom: 1px solid {fg}33; }}"
+                                  f" QFrame#sigBanner QLabel {{ color: {fg}; }}")
+        if text:
+            self.banner_text.setText(text)
+
     def display_title(self) -> str:
         return ("* " if self.pdf.dirty else "") + self.pdf.title
 
@@ -326,6 +366,29 @@ class DocumentTab(QWidget):
                 f"{total} match{'es' if total != 1 else ''} for “{st['text']}”")
             if total and not self.sidebar.isVisible():
                 pass
+
+    def highlight_all_hits(self) -> None:
+        """Turn every search match into a highlight comment."""
+        if jobs.busy() or not self.hits:
+            if not self.hits:
+                self.window().statusBar().showMessage("Search for something first.", 4000)
+            return
+        from pdfdesk import annots
+        color = self.opt.color("highlight")
+        total = sum(len(r) for r in self.hits.values())
+        if total > 5000:
+            self.window().statusBar().showMessage(f"{total} matches is too many to highlight; narrow the search.",
+                                                  6000)
+            return
+        count = 0
+        with self.pdf.edit("Highlight matches", pages=sorted(self.hits)):
+            for pno, rects in self.hits.items():
+                page = self.pdf.page(pno)
+                for r in rects:
+                    annots.add_text_markup(page, "highlight", [r], color, self.opt.opacity_for("highlight"),
+                                           self.opt.author, self.findbar.edit.text().strip())
+                    count += 1
+        self.window().statusBar().showMessage(f"Highlighted {count} match(es).", 5000)
 
     def _show_hit(self, pno: int, idx: int) -> None:
         self.canvas.show_hit(pno, idx)

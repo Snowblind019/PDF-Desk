@@ -3,7 +3,8 @@
 #
 #   ./install.sh               install or update for the current user
 #   ./install.sh --default     also make PDF Desk the default app for PDFs
-#   ./install.sh --extras      also install LibreOffice and OCR language files (asks for sudo)
+#   ./install.sh --extras      also install LibreOffice, OCR language files and a voice for
+#                              Read Out Loud (asks for sudo)
 #   ./install.sh --wheels DIR  install Python packages from a local folder (no internet)
 #   ./install.sh --unlocked    use the newest package versions instead of the tested, hash-checked ones
 #
@@ -33,7 +34,7 @@ while [ $# -gt 0 ]; do
         --extras) EXTRAS=1 ;;
         --wheels) WHEELS="$(cd "$2" && pwd)"; shift ;;
         --unlocked) UNLOCKED=1 ;;
-        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
     shift
@@ -67,20 +68,21 @@ say "Using $("$PY" --version) at $PY"
 
 # ---- optional extras through the system package manager
 if [ "$EXTRAS" = 1 ]; then
-    say "Installing LibreOffice and OCR language files (English and Romanian)"
+    say "Installing LibreOffice, OCR language files (English and Romanian) and the espeak-ng voice"
     if command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y libreoffice-writer libreoffice-calc libreoffice-impress \
-            tesseract-langpack-eng tesseract-langpack-ron || true
+            tesseract-langpack-eng tesseract-langpack-ron espeak-ng || true
     elif command -v apt-get >/dev/null 2>&1; then
         sudo apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress \
-            tesseract-ocr-eng tesseract-ocr-ron || true
+            tesseract-ocr-eng tesseract-ocr-ron espeak-ng || true
     elif command -v pacman >/dev/null 2>&1; then
-        sudo pacman -S --needed --noconfirm libreoffice-fresh tesseract-data-eng tesseract-data-ron || true
+        sudo pacman -S --needed --noconfirm libreoffice-fresh tesseract-data-eng tesseract-data-ron \
+            espeak-ng || true
     elif command -v zypper >/dev/null 2>&1; then
         sudo zypper install -y libreoffice-writer libreoffice-calc libreoffice-impress \
-            tesseract-ocr-traineddata-english || true
+            tesseract-ocr-traineddata-english espeak-ng || true
     else
-        echo "Unknown package manager. Install LibreOffice and Tesseract language data yourself."
+        echo "Unknown package manager. Install LibreOffice, Tesseract language data and espeak-ng yourself."
     fi
 fi
 
@@ -175,4 +177,8 @@ for f in /usr/share/tesseract*/tessdata/*.traineddata /usr/share/tesseract-ocr/*
 done
 if [ "$HAVE_OCR" = 0 ]; then
     echo "Optional: install OCR language files for Recognize Text (or rerun with --extras)."
+fi
+if ! command -v espeak-ng >/dev/null 2>&1 && ! command -v espeak >/dev/null 2>&1 && \
+   ! command -v spd-say >/dev/null 2>&1; then
+    echo "Optional: install espeak-ng for Read Out Loud (or rerun with --extras)."
 fi

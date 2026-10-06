@@ -2,7 +2,7 @@
 ; Run build.ps1 first; it compiles this automatically when Inno Setup 6 is installed.
 
 #define AppName "PDF Desk"
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 #define AppExe "PDF Desk.exe"
 
 [Setup]

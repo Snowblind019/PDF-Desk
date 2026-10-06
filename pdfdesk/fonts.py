@@ -7,6 +7,7 @@ Romanian ș/ț or ă falls back to a Unicode font that ships with pymupdf-fonts
 from __future__ import annotations
 
 import os
+import secrets
 from functools import lru_cache
 
 import pymupdf as fitz
@@ -98,9 +99,10 @@ class FontChoice:
         return self._font
 
     def register(self, page: fitz.Page) -> str:
-        if self.buffer:
-            page.insert_font(fontname=self.code, fontbuffer=self.buffer)
-        return self.code
+        if not self.buffer and _name_is_free(page, self.code):
+            page.insert_font(fontname=self.code)
+            return self.code
+        return _insert_private(page, self.buffer or fitz.Font(self.code).buffer)
 
     def width(self, text: str, size: float) -> float:
         return self.font.text_length(text, fontsize=size)
@@ -130,20 +132,58 @@ def ensure_wrapped(page: fitz.Page) -> None:
         pass
 
 
+def _name_is_free(page: fitz.Page, name: str) -> bool:
+    """True if the page has no font of its own under this resource name. A PDF could define its own
+    "helv" (with other glyphs), and new text must never be drawn with that by accident."""
+    try:
+        return name not in {f[4] for f in page.get_fonts(full=False)}
+    except Exception:
+        return False
+
+
+def _insert_private(page: fitz.Page, buffer: bytes) -> str:
+    """Add a font to the page under a fresh random resource name nobody can predict."""
+    for _ in range(5):
+        name = "PD" + secrets.token_hex(5)
+        if _name_is_free(page, name):
+            break
+    page.insert_font(fontname=name, fontbuffer=buffer)
+    return name
+
+
+def register_font(page: fitz.Page, family: str, bold: bool, italic: bool, text: str) -> str:
+    """Make a font from PDF Desk's font list usable on `page` for `text`; returns its resource name.
+    Only the letters in `text` are embedded. The classic PDF fonts need no embedding at all."""
+    from pdfdesk import fontcatalog
+    face, _real = fontcatalog.catalog().face(family, bold, italic)
+    if face.source == "builtin":
+        if is_latin1(text):
+            return FontChoice(face.code, None).register(page)
+        generic = "serif" if "Times" in face.family else "mono" if "Courier" in face.family else "sans"
+        return choose_font(text, generic, bold, italic).register(page)
+    return _insert_private(page, fontcatalog.subset_bytes(face, text))
+
+
 def insert_text(page: fitz.Page, point, text: str, size: float = 12, color=(0, 0, 0),
                 family: str = "sans", bold: bool = False, italic: bool = False,
                 rotate: int = 0, morph=None, opacity: float = 1.0, overlay: bool = True,
                 render_mode: int = 0) -> None:
-    """Insert one line of text with a font that can actually show it."""
+    """Insert one line of text with a font that can actually show it. `family` is "sans", "serif",
+    "mono" or the name of any font in PDF Desk's font list."""
     ensure_wrapped(page)
-    choice = choose_font(text, family, bold, italic)
-    name = choice.register(page)
+    if family in FAMILIES:
+        name = choose_font(text, family, bold, italic).register(page)
+    else:
+        name = register_font(page, family, bold, italic, text)
     page.insert_text(point, text, fontsize=size, fontname=name, color=color, rotate=rotate,
                      morph=morph, fill_opacity=opacity, stroke_opacity=opacity,
                      overlay=overlay, render_mode=render_mode)
 
 
 def text_width(text: str, size: float, family: str = "sans", bold: bool = False, italic: bool = False) -> float:
+    if family not in FAMILIES:
+        from pdfdesk import fontcatalog
+        return fontcatalog.text_width(family, bold, italic, text, size)
     return choose_font(text, family, bold, italic).width(text, size)
 
 
@@ -153,10 +193,13 @@ def span_style(span: dict) -> tuple[str, bool, bool]:
     flags = span.get("flags", 0)
     bold = bool(flags & 16) or "bold" in name or "black" in name or "heavy" in name
     italic = bool(flags & 2) or "italic" in name or "oblique" in name
+    sans_names = ("sans", "arial", "helvet", "verdana", "calibri", "tahoma", "segoe", "inter", "roboto", "carlito")
     if flags & 8 or "mono" in name or "courier" in name or "consol" in name:
         family = "mono"
-    elif (flags & 4 or "times" in name or ("serif" in name and "sans" not in name)
-          or "georgia" in name or "garamond" in name or "cambria" in name or "roman" in name):
+    elif any(w in name for w in sans_names):
+        family = "sans"  # the name wins: some PDFs mark sans fonts as serif
+    elif (flags & 4 or "times" in name or "serif" in name or "georgia" in name or "garamond" in name
+          or "cambria" in name or "roman" in name):
         family = "serif"
     else:
         family = "sans"

@@ -8,3 +8,9 @@ openpyxl>=3.1
 python-pptx>=0.6.23
 Markdown>=3.5
 Pillow>=10.0
+fonttools>=4.50
+# Digital IDs and digital signatures (signing and checking never go online)
+pyHanko>=0.30
+pyhanko-certvalidator>=0.27
+cryptography>=42
+tzdata; sys_platform == "win32"

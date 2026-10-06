@@ -1,15 +1,15 @@
-"""Left sidebar panels: page thumbnails, bookmarks, comments and search results."""
+"""Left sidebar panels: page thumbnails, bookmarks, comments, attachments, layers and search results."""
 from __future__ import annotations
 
 import pymupdf as fitz
 from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QInputDialog, QListView, QListWidget,
                                QListWidgetItem, QMenu, QToolButton, QTreeWidget, QTreeWidgetItem,
                                QVBoxLayout, QWidget, QLabel)
 
 from pdfdesk import ui
-from pdfdesk import annots, fonts, icons, jobs
+from pdfdesk import annots, fonts, icons, jobs, safety
 from pdfdesk.document import PdfDocument
 
 
@@ -68,6 +68,7 @@ class ThumbList(QListWidget):
         self.box = box
         self.grid = grid
         self.night = False
+        self._drop_line = None
         self._rendered: dict[int, tuple] = {}
         self.setViewMode(QListView.ViewMode.IconMode)
         self.setResizeMode(QListView.ResizeMode.Adjust)
@@ -92,9 +93,11 @@ class ThumbList(QListWidget):
             self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.setDragEnabled(True)
             self.setAcceptDrops(True)
-            self.setDropIndicatorShown(True)
+            self.setDropIndicatorShown(False)  # our own marker line is drawn in paintEvent
             self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
             self.setDefaultDropAction(Qt.DropAction.MoveAction)
+            # setMovement(Static) above turned drops off on the viewport, which is where they land
+            self.viewport().setAcceptDrops(True)
         self.rebuild()
         pdf.structure_changed.connect(self.rebuild)
         pdf.changed.connect(self._pages_changed)
@@ -113,8 +116,14 @@ class ThumbList(QListWidget):
         cur = self.currentRow()
         self.blockSignals(True)
         self.clear()
+        from pdfdesk.docfeatures import all_labels
+        labels = all_labels(self.pdf.doc)
         for i in range(self.pdf.page_count):
-            item = QListWidgetItem(placeholder(self.pdf, i, self.box), str(i + 1))
+            text = str(i + 1)
+            label = labels[i] if i < len(labels) else ""
+            if label and label != text:
+                text = f"{label[:12]} ({i + 1})"
+            item = QListWidgetItem(placeholder(self.pdf, i, self.box), text)
             item.setData(Qt.ItemDataRole.UserRole, i)
             item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
             item.setSizeHint(QSize(self.box + 20, self.box + 26))
@@ -214,19 +223,68 @@ class ThumbList(QListWidget):
                 menu.addAction(label, lambda a=action: self.page_action.emit(a, pno))
         menu.exec(self.viewport().mapToGlobal(pos))
 
+    # Drag to reorder (Organize pages). Qt's icon view only accepts drops on empty space, so the
+    # moves are handled here: work out where the pages would land and draw a line there.
+    def _drop_spot(self, pos: QPoint) -> tuple[int, tuple[int, int, int] | None]:
+        """Return (insert-before index, (x, top, bottom) of the marker line or None)."""
+        before, line = None, None
+        half = self.spacing() // 2 + 1
+        for row in range(self.count()):
+            rect = self.visualItemRect(self.item(row))
+            if rect.top() <= pos.y() <= rect.bottom():
+                if pos.x() < rect.center().x():
+                    return row, (rect.left() - half, rect.top(), rect.bottom())
+                before, line = row + 1, (rect.right() + half, rect.top(), rect.bottom())
+        if before is None:
+            return self.count(), None
+        return before, line
+
+    def _own_drag(self, ev) -> bool:
+        return self.grid and ev.source() is self
+
+    def dragEnterEvent(self, ev) -> None:
+        if not self._own_drag(ev):
+            ev.ignore()
+            return
+        super().dragEnterEvent(ev)
+        ev.setDropAction(Qt.DropAction.MoveAction)
+        ev.accept()
+
+    def dragMoveEvent(self, ev) -> None:
+        if not self._own_drag(ev):
+            ev.ignore()
+            return
+        super().dragMoveEvent(ev)  # keeps auto-scrolling near the edges
+        line = self._drop_spot(ev.position().toPoint())[1]
+        if line != self._drop_line:
+            self._drop_line = line
+            self.viewport().update()
+        ev.setDropAction(Qt.DropAction.MoveAction)
+        ev.accept()
+
+    def dragLeaveEvent(self, ev) -> None:
+        super().dragLeaveEvent(ev)
+        self._drop_line = None
+        self.viewport().update()
+
+    def paintEvent(self, ev) -> None:
+        super().paintEvent(ev)
+        if self._drop_line is not None:
+            x, top, bottom = self._drop_line
+            p = QPainter(self.viewport())
+            p.setPen(QPen(self.palette().color(QPalette.ColorRole.Highlight), 3))
+            p.drawLine(x, top + 4, x, bottom - 4)
+            p.end()
+
     def dropEvent(self, ev) -> None:
-        if ev.source() is not self:
+        self._drop_line = None
+        self.viewport().update()
+        if not self._own_drag(ev):
             ev.ignore()
             return
         moved = self.selected_pages()
-        target = self.indexAt(ev.position().toPoint())
-        if target.isValid():
-            rect = self.visualRect(target)
-            before = target.row()
-            if ev.position().x() > rect.center().x():
-                before += 1
-        else:
-            before = self.count()
+        before = self._drop_spot(ev.position().toPoint())[0]
+        # IgnoreAction tells Qt not to delete the dragged items itself: the pages move below
         ev.setDropAction(Qt.DropAction.IgnoreAction)
         ev.accept()
         if moved:
@@ -243,6 +301,7 @@ class _BookmarkTree(QTreeWidget):
 
 class BookmarkPanel(QWidget):
     go_to = Signal(int)
+    auto_requested = Signal()
 
     def __init__(self, pdf: PdfDocument, current_page_fn, parent=None):
         super().__init__(parent)
@@ -253,7 +312,8 @@ class BookmarkPanel(QWidget):
         bar = QHBoxLayout()
         for name, tip, fn in (("bookmark", "Add a bookmark for the current page", self.add),
                               ("square-pen", "Rename the selected bookmark", self.rename),
-                              ("trash-2", "Delete the selected bookmark", self.delete)):
+                              ("trash-2", "Delete the selected bookmark", self.delete),
+                              ("wand-sparkles", "Make bookmarks from the headings", self.auto_requested.emit)):
             b = QToolButton()
             icons.bind(b, name)
             b.setToolTip(tip)
@@ -371,15 +431,24 @@ class BookmarkPanel(QWidget):
 class CommentsPanel(QWidget):
     open_annot = Signal(int, int)  # page, xref
     delete_annot = Signal(int, int)
+    export_requested = Signal()
 
     def __init__(self, pdf: PdfDocument, parent=None):
         super().__init__(parent)
         self.pdf = pdf
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
+        top = QHBoxLayout()
         self.count_label = QLabel()
         self.count_label.setObjectName("muted")
-        lay.addWidget(self.count_label)
+        self.count_label.setWordWrap(True)
+        top.addWidget(self.count_label, 1)
+        export = QToolButton()
+        icons.bind(export, "file-output")
+        export.setToolTip("Export a summary of all comments (CSV or Markdown)")
+        export.clicked.connect(self.export_requested.emit)
+        top.addWidget(export)
+        lay.addLayout(top)
         self.list = QListWidget()
         self.list.setWordWrap(True)
         self.list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -483,3 +552,178 @@ class SearchPanel(QWidget):
                 self.list.setCurrentRow(row)
                 self.list.scrollToItem(self.list.item(row))
                 return
+
+
+def _size_text(n: int) -> str:
+    size = float(n or 0)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{n} bytes"
+
+
+class AttachmentsPanel(QWidget):
+    """Files attached to the PDF. They can be saved or removed, and new files attached. Attached files
+    are never run: only attached PDFs can be opened, and only inside PDF Desk."""
+    add_requested = Signal()
+    save_requested = Signal(dict)
+    delete_requested = Signal(dict)
+    open_pdf_requested = Signal(dict)
+
+    def __init__(self, pdf: PdfDocument, parent=None):
+        super().__init__(parent)
+        self.pdf = pdf
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        bar = QHBoxLayout()
+        for name, tip, fn in (("paperclip", "Attach a file to this PDF", self.add_requested.emit),
+                              ("save", "Save the selected attachment as a file", self._save),
+                              ("trash-2", "Remove the selected attachment", self._delete)):
+            b = QToolButton()
+            icons.bind(b, name)
+            b.setToolTip(tip)
+            b.clicked.connect(fn)
+            bar.addWidget(b)
+        bar.addStretch(1)
+        lay.addLayout(bar)
+        self.list = QListWidget()
+        self.list.setWordWrap(True)
+        self.list.itemDoubleClicked.connect(self._double)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._menu)
+        lay.addWidget(self.list, 1)
+        self.empty = QLabel("No attached files.")
+        self.empty.setObjectName("muted")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.empty)
+        self._stale = True
+        pdf.changed.connect(self._mark)
+
+    def _mark(self, *_):
+        self._stale = True
+        if self.isVisible():
+            QTimer.singleShot(200, self.reload)
+
+    def showEvent(self, ev) -> None:
+        super().showEvent(ev)
+        if self._stale:
+            QTimer.singleShot(0, self.reload)
+
+    def reload(self) -> None:
+        if jobs.busy():
+            QTimer.singleShot(500, self.reload)
+            return
+        from pdfdesk import docfeatures
+        self._stale = False
+        self.list.clear()
+        try:
+            items = docfeatures.list_attachments(self.pdf.doc)
+        except Exception:
+            items = []
+        for it in items:
+            where = f"page {it['page'] + 1}" if it["page"] is not None else "whole document"
+            text = f"{safety.clean_text(it['name'], 120)}\n{_size_text(it['size'])}  ·  {where}"
+            if it["desc"]:
+                text += f"\n{safety.clean_text(it['desc'], 120)}"
+            row = QListWidgetItem(icons.icon("paperclip"), text)
+            row.setData(Qt.ItemDataRole.UserRole, it)
+            row.setToolTip(ui.tip(it["name"]))
+            self.list.addItem(row)
+        self.empty.setVisible(not items)
+
+    def current(self) -> dict | None:
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _save(self) -> None:
+        it = self.current()
+        if it:
+            self.save_requested.emit(it)
+
+    def _delete(self) -> None:
+        it = self.current()
+        if it:
+            self.delete_requested.emit(it)
+
+    def _double(self, item) -> None:
+        it = item.data(Qt.ItemDataRole.UserRole)
+        if it["name"].lower().endswith(".pdf"):
+            self.open_pdf_requested.emit(it)
+        else:
+            self.save_requested.emit(it)
+
+    def _menu(self, pos) -> None:
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        it = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        if it["name"].lower().endswith(".pdf"):
+            menu.addAction("Open in PDF Desk", lambda: self.open_pdf_requested.emit(it))
+        menu.addAction("Save as...", lambda: self.save_requested.emit(it))
+        menu.addAction("Remove", lambda: self.delete_requested.emit(it))
+        menu.exec(self.list.viewport().mapToGlobal(pos))
+
+
+class LayersPanel(QWidget):
+    """Show or hide the layers (optional content) of a PDF, like Acrobat's Layers panel."""
+    changed = Signal()
+
+    def __init__(self, pdf: PdfDocument, parent=None):
+        super().__init__(parent)
+        self.pdf = pdf
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.itemChanged.connect(self._toggled)
+        lay.addWidget(self.tree, 1)
+        self.empty = QLabel("This PDF has no layers.")
+        self.empty.setObjectName("muted")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.empty)
+        self._loading = False
+        pdf.structure_changed.connect(self.reload)
+        self.reload()
+
+    def reload(self) -> None:
+        self._loading = True
+        self.tree.clear()
+        try:
+            configs = self.pdf.doc.layer_ui_configs()
+        except Exception:
+            configs = []
+        parents: list[QTreeWidgetItem] = []
+        for cfg in configs:
+            item = QTreeWidgetItem([str(cfg.get("text") or "Layer")[:120]])
+            item.setData(0, Qt.ItemDataRole.UserRole, cfg.get("number"))
+            if cfg.get("type") in ("checkbox", "radiobox"):
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(0, Qt.CheckState.Checked if cfg.get("on") else Qt.CheckState.Unchecked)
+                if cfg.get("locked"):
+                    item.setDisabled(True)
+            depth = int(cfg.get("depth") or 0)
+            parents = parents[:depth]
+            if parents:
+                parents[-1].addChild(item)
+            else:
+                self.tree.addTopLevelItem(item)
+            parents.append(item)
+        self.tree.expandAll()
+        self.empty.setVisible(not configs)
+        self.tree.setVisible(bool(configs))
+        self._loading = False
+
+    def _toggled(self, item, _col) -> None:
+        if self._loading or jobs.busy():
+            return
+        number = item.data(0, Qt.ItemDataRole.UserRole)
+        on = item.checkState(0) == Qt.CheckState.Checked
+        try:
+            self.pdf.doc.set_layer_ui_config(number, action=1 if on else 2)
+        except Exception:
+            return
+        self.pdf.epoch += 1  # redraw every page with the new layer visibility (not an edit)
+        self.pdf.changed.emit(None)
+        QTimer.singleShot(0, self.reload)

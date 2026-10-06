@@ -37,7 +37,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $AppName = "PDF Desk"
-$Version = "1.0.0"
+$Version = "1.1.0"
 $Src = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Dest = Join-Path $env:LOCALAPPDATA "Programs\PDF Desk"
 $AppDir = Join-Path $Dest "app"

@@ -21,6 +21,15 @@ from pdfdesk.fonts import hex_to_rgb
 from pdfdesk.widgets import ColorButton, PathPicker
 
 
+def _font_picker(initial: str = "Helvetica"):
+    """A font list like Word's, starting on `initial`."""
+    from pdfdesk import fontcatalog
+    from pdfdesk.textformat import FontComboBox
+    box = FontComboBox()
+    box.set_family(fontcatalog.catalog().resolve(initial))
+    return box
+
+
 def _buttons(dlg: QDialog, ok_text: str = "OK") -> QDialogButtonBox:
     box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
     box.button(QDialogButtonBox.StandardButton.Ok).setText(ok_text)
@@ -581,7 +590,9 @@ class WatermarkDialog(_Validated):
         self.color = ColorButton("#c8323c")
         self.bold = QCheckBox("Bold")
         self.bold.setChecked(True)
+        self.font = _font_picker("Helvetica")
         f.addRow("Text:", self.text)
+        f.addRow("Font:", self.font)
         f.addRow("Font size:", self.size)
         f.addRow("Color:", self.color)
         f.addRow("", self.bold)
@@ -623,6 +634,7 @@ class WatermarkDialog(_Validated):
         self._timer.setInterval(200)
         self._timer.timeout.connect(self._update_preview)
         for sig in (self.text.textChanged, self.size.valueChanged, self.color.color_changed, self.bold.toggled,
+                    self.font.font_chosen,
                     self.opacity.valueChanged, self.angle.valueChanged, self.behind.currentIndexChanged,
                     self.tabs.currentChanged, self.image.changed, self.scale.valueChanged):
             sig.connect(lambda *_: self._timer.start())
@@ -632,7 +644,8 @@ class WatermarkDialog(_Validated):
         if self.tabs.currentIndex() == 0:
             pdfops.add_text_watermark(doc, pages, self.text.text(), self.size.value(), hex_to_rgb(self.color.color()),
                                       self.opacity.value() / 100, self.angle.value(),
-                                      behind=self.behind.currentIndex() == 1, bold=self.bold.isChecked())
+                                      behind=self.behind.currentIndex() == 1, bold=self.bold.isChecked(),
+                                      family=self.font.family() or "Helvetica")
         else:
             pdfops.add_image_watermark(doc, pages, self.image.path(), self.scale.value() / 100,
                                        self.opacity.value() / 100, behind=self.behind.currentIndex() == 1)
@@ -663,6 +676,7 @@ HF_PRESETS = [
     ("Page number (bottom right)", {"footer_right": "{page}"}),
     ("Page number (bottom center)", {"footer_center": "{page}"}),
     ("File name and date (top)", {"header_left": "{filename}", "header_right": "{date}"}),
+    ("Bates number (bottom right)", {"footer_right": "{bates}"}),
 ]
 
 
@@ -693,7 +707,7 @@ class HeaderFooterDialog(_Validated):
                 grid.addWidget(e, r + 1, c + 1)
                 self.slots[f"{part}_{side}"] = e
         left.addLayout(grid)
-        left.addWidget(muted("You can use {page}, {pages}, {date}, {filename} and {title} in the text."))
+        left.addWidget(muted("You can use {page}, {pages}, {date}, {filename}, {title} and {bates} in the text."))
         form = QFormLayout()
         self.size = QSpinBox()
         self.size.setRange(5, 48)
@@ -706,14 +720,30 @@ class HeaderFooterDialog(_Validated):
         self.start = QSpinBox()
         self.start.setRange(0, 100000)
         self.start.setValue(1)
-        self.font = QComboBox()
-        self.font.addItems(["Sans serif", "Serif", "Monospace"])
+        self.font = _font_picker("Helvetica")
         self.range = PageRangeEdit(pdf.page_count, current)
         form.addRow("Font:", self.font)
         form.addRow("Size:", self.size)
         form.addRow("Color:", self.color)
         form.addRow("Distance from edge:", self.margin)
         form.addRow("First page number:", self.start)
+        bates = QHBoxLayout()
+        self.bates_prefix = QLineEdit("ABC")
+        self.bates_prefix.setMaximumWidth(90)
+        self.bates_start = QSpinBox()
+        self.bates_start.setRange(0, 999999999)
+        self.bates_start.setValue(1)
+        self.bates_digits = QSpinBox()
+        self.bates_digits.setRange(1, 12)
+        self.bates_digits.setValue(6)
+        for label, w in (("Prefix", self.bates_prefix), ("Start", self.bates_start), ("Digits", self.bates_digits)):
+            bates.addWidget(QLabel(label))
+            bates.addWidget(w)
+        bates.addStretch(1)
+        bates_host = QWidget()
+        bates.setContentsMargins(0, 0, 0, 0)
+        bates_host.setLayout(bates)
+        form.addRow("Bates number:", bates_host)
         form.addRow("Pages:", self.range)
         left.addLayout(form)
         left.addStretch(1)
@@ -728,7 +758,8 @@ class HeaderFooterDialog(_Validated):
         for e in self.slots.values():
             e.textChanged.connect(lambda *_: self._timer.start())
         for sig in (self.size.valueChanged, self.color.color_changed, self.margin.valueChanged,
-                    self.start.valueChanged, self.font.currentIndexChanged):
+                    self.start.valueChanged, self.font.font_chosen, self.bates_prefix.textChanged,
+                    self.bates_start.valueChanged, self.bates_digits.valueChanged):
             sig.connect(lambda *_: self._timer.start())
         self.preset.setCurrentIndex(1)
 
@@ -743,12 +774,16 @@ class HeaderFooterDialog(_Validated):
         self._timer.start()
 
     def family(self) -> str:
-        return ["sans", "serif", "mono"][self.font.currentIndex()]
+        return self.font.family() or "Helvetica"
+
+    def bates(self) -> dict:
+        return {"bates_prefix": self.bates_prefix.text()[:40], "bates_start": self.bates_start.value(),
+                "bates_digits": self.bates_digits.value()}
 
     def apply(self, doc: fitz.Document, pages: list[int], filename: str) -> None:
         pdfops.add_header_footer(doc, pages, {k: e.text() for k, e in self.slots.items()}, self.size.value(),
                                  hex_to_rgb(self.color.color()), self.margin.value(), self.start.value(),
-                                 self.family(), filename)
+                                 self.family(), filename, **self.bates())
 
     def _update_preview(self) -> None:
         try:
@@ -758,7 +793,8 @@ class HeaderFooterDialog(_Validated):
                      .replace("{pages}", str(self.pdf.page_count + self.start.value() - 1))
                      for k, e in self.slots.items()}
             pdfops.add_header_footer(tmp, [0], slots, self.size.value(), hex_to_rgb(self.color.color()),
-                                     self.margin.value(), self.start.value(), self.family(), self.pdf.title)
+                                     self.margin.value(), self.start.value(), self.family(), self.pdf.title,
+                                     **self.bates())
             _render_preview(tmp, self.preview)
         except Exception:
             pass
@@ -1137,16 +1173,26 @@ class SettingsDialog(QDialog):
 # =========================================================================== help
 
 SHORTCUTS = [
-    ("Open", "Ctrl+O"), ("Save", "Ctrl+S"), ("Save as", "Ctrl+Shift+S"), ("Print", "Ctrl+P"),
-    ("Close tab", "Ctrl+W"), ("Next / previous tab", "Ctrl+Tab / Ctrl+Shift+Tab"), ("Home screen", "Ctrl+H"),
-    ("Undo / redo", "Ctrl+Z / Ctrl+Y"), ("Copy selected text", "Ctrl+C"), ("Find", "Ctrl+F"),
-    ("Next / previous match", "F3 / Shift+F3"), ("Zoom in / out", "Ctrl++ / Ctrl+-  (or Ctrl+mouse wheel)"),
-    ("Actual size", "Ctrl+0"), ("Fit width / fit page", "Ctrl+1 / Ctrl+2"), ("Go to page", "Ctrl+G"),
-    ("First / last page", "Home / End"), ("Rotate page", "Ctrl+R / Ctrl+Shift+R"), ("Add bookmark", "Ctrl+B"),
-    ("Sidebar", "F4"), ("Organize pages", "Ctrl+Shift+O"), ("Full screen", "F11"),
-    ("Select tool", "Esc"), ("Delete selected comment", "Delete"), ("Nudge selected item", "Arrow keys (Shift = 10x)"),
-    ("Finish typing in a text box", "Ctrl+Enter or click outside"), ("Night mode", "Ctrl+Shift+N"),
-    ("Document properties", "Ctrl+D"), ("Preferences", "Ctrl+,"), ("PDF from clipboard", "Ctrl+Shift+V"),
+    ("Open", "Ctrl+O"), ("New blank PDF", "Ctrl+N"), ("Save", "Ctrl+S"), ("Save as", "Ctrl+Shift+S"),
+    ("Print", "Ctrl+P"), ("Close tab", "Ctrl+W"), ("Next / previous tab", "Ctrl+Tab / Ctrl+Shift+Tab"),
+    ("Home screen", "Ctrl+H"), ("Undo / redo", "Ctrl+Z / Ctrl+Y"), ("Copy selected text", "Ctrl+C"),
+    ("Select all text on the page", "Ctrl+A"), ("Find", "Ctrl+F"), ("Next / previous match", "F3 / Shift+F3"),
+    ("Zoom in / out", "Ctrl++ / Ctrl+-  (or Ctrl+mouse wheel)"), ("Actual size", "Ctrl+0"),
+    ("Fit width / fit page", "Ctrl+1 / Ctrl+2"), ("Go to page", "Ctrl+G"), ("First / last page", "Home / End"),
+    ("Rotate page", "Ctrl+R / Ctrl+Shift+R"), ("Add bookmark", "Ctrl+B"), ("Sidebar", "F4"),
+    ("Organize pages", "Ctrl+Shift+O"), ("Full screen", "F11"), ("Presentation", "F5 (Esc to leave)"),
+    ("Presentation: next / previous page", "Space, arrows or click / Backspace or right-click"),
+    ("Presentation: dark pages on / off", "B"), ("Reader view", "Ctrl+4"),
+    ("Read this page out loud", "Ctrl+Shift+Y"), ("Read to the end", "Ctrl+Shift+B"),
+    ("Stop reading", "Ctrl+Shift+E"), ("Select tool", "Esc"), ("Delete selected comment", "Delete"),
+    ("Nudge selected item", "Arrow keys (Shift = 10x)"),
+    ("Finish typing in a text box", "Ctrl+Enter or click outside"),
+    ("Text box: bold / italic / underline", "Ctrl+B / Ctrl+I / Ctrl+U (while typing)"),
+    ("Text box: bigger / smaller text", "Ctrl+] / Ctrl+[ (while typing)"),
+    ("Text box: align left / center / right / justify", "Ctrl+L / Ctrl+E / Ctrl+R / Ctrl+J (while typing)"),
+    ("Finish a measurement (distance, perimeter, area)", "Double-click or Enter"),
+    ("Night mode", "Ctrl+Shift+N"), ("Document properties", "Ctrl+D"), ("Preferences", "Ctrl+,"),
+    ("PDF from clipboard", "Ctrl+Shift+V"), ("Keyboard shortcuts", "F1"), ("Quit", "Ctrl+Q"),
 ]
 
 
@@ -1174,21 +1220,30 @@ class ShortcutsDialog(QDialog):
 def about_text() -> str:
     import PySide6
     import html
+    from pdfdesk import digitalid, speech
     lo = externals.libreoffice_command()
     folder, langs = externals.find_tessdata()
+    if digitalid.available():
+        import pyhanko
+        signing = f"pyHanko {html.escape(getattr(pyhanko, '__version__', ''))} (digital signatures)"
+    else:
+        signing = "Digital signatures: pyHanko not installed"
     langs = [html.escape(x) for x in langs]
     return (f"<h3>{APP_NAME} {__version__}</h3>"
             f"<p>An offline PDF viewer, editor and converter for Linux and Windows.<br>"
             f"Nothing is uploaded anywhere. Everything runs on this computer.</p>"
             f"<p><b>Built with</b><br>PyMuPDF {fitz.VersionBind} (MuPDF {fitz.VersionFitz})<br>"
-            f"PySide6 / Qt {PySide6.__version__}<br>Icons: Lucide (ISC license)</p>"
+            f"PySide6 / Qt {PySide6.__version__}<br>{signing}<br>fontTools (font subsetting)<br>"
+            f"Fonts: FiraGO, Fira Mono, Noto Sans, Ubuntu, Space Mono, Cascadia Mono (open font licenses)<br>"
+            f"Icons: Lucide (ISC license)</p>"
             f"<p><b>Optional extras</b><br>LibreOffice: {'found' if lo else 'not found'}<br>"
-            f"OCR languages: {', '.join(langs) if langs else 'none found'}</p>")
+            f"OCR languages: {', '.join(langs) if langs else 'none found'}<br>"
+            f"Read Out Loud voice: {'found' if speech.available() else 'not found'}</p>")
 
 
 EXTRAS_HELP = """<h3>Optional extras</h3>
-<p>PDF Desk works on its own. Two free programs add more conversions and OCR.
-Both run offline once installed.</p>
+<p>PDF Desk works on its own. A few free programs add more conversions, OCR and a voice for
+Read Out Loud. All of them run offline once installed.</p>
 <p><b>LibreOffice</b> (for .doc, .xls, .ppt, .odt, .rtf and best quality .docx/.xlsx/.pptx import)<br>
 Fedora: <code>sudo dnf install libreoffice</code><br>
 Ubuntu/Debian: <code>sudo apt install libreoffice</code><br>
@@ -1197,4 +1252,885 @@ Windows: install from libreoffice.org, then restart PDF Desk.</p>
 Fedora: <code>sudo dnf install tesseract-langpack-eng tesseract-langpack-ron</code><br>
 Ubuntu/Debian: <code>sudo apt install tesseract-ocr-eng tesseract-ocr-ron</code><br>
 Windows: install Tesseract OCR (the UB Mannheim build) and tick the languages you need,
-or copy <code>.traineddata</code> files into PDF Desk's tessdata folder (Preferences &gt; Extras).</p>"""
+or copy <code>.traineddata</code> files into PDF Desk's tessdata folder (Preferences &gt; Extras).</p>
+<p><b>A voice for Read Out Loud</b> (Linux only; Windows has one built in)<br>
+Fedora: <code>sudo dnf install espeak-ng</code><br>
+Ubuntu/Debian: <code>sudo apt install espeak-ng</code></p>"""
+
+
+# =========================================================================== form fields
+
+class FieldPropertiesDialog(_Validated):
+    """Name, tooltip, required/read-only, look and (for lists) the choices of one form field."""
+
+    def __init__(self, parent, props: dict):
+        super().__init__(parent)
+        from pdfdesk import forms
+        from PySide6.QtWidgets import QPlainTextEdit
+        kind = props.get("kind", "text")
+        self.kind = kind
+        self.props = dict(props)
+        self.setWindowTitle(f"{forms.KIND_LABELS.get(kind, 'Field')} properties")
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name = QLineEdit(props.get("name", ""))
+        self.name.setEnabled(kind != "radio")
+        self.tooltip = QLineEdit(props.get("tooltip", ""))
+        self.tooltip.setPlaceholderText("Shown when someone points at the field")
+        self.required = QCheckBox("Required")
+        self.required.setChecked(bool(props.get("required")))
+        self.read_only = QCheckBox("Read-only")
+        self.read_only.setChecked(bool(props.get("read_only")))
+        flags = QHBoxLayout()
+        flags.addWidget(self.required)
+        flags.addWidget(self.read_only)
+        flags.addStretch(1)
+        form.addRow("Name:", self.name)
+        if kind == "radio":
+            form.addRow("", muted("Radio buttons share the name of their group."))
+        form.addRow("Tooltip:", self.tooltip)
+        form.addRow("", self._wrap(flags))
+        self.multiline = self.max_length = self.align = self.choices = self.editable = None
+        if kind == "text":
+            self.multiline = QCheckBox("Allow several lines")
+            self.multiline.setChecked(bool(props.get("multiline")))
+            self.max_length = QSpinBox()
+            self.max_length.setRange(0, 10000)
+            self.max_length.setSpecialValueText("No limit")
+            self.max_length.setValue(int(props.get("max_length") or 0))
+            self.align = QComboBox()
+            self.align.addItems(["Left", "Center", "Right"])
+            self.align.setCurrentIndex(int(props.get("align") or 0))
+            form.addRow("", self.multiline)
+            form.addRow("Maximum characters:", self.max_length)
+            form.addRow("Text alignment:", self.align)
+        if kind in ("combo", "list"):
+            self.choices = QPlainTextEdit("\n".join(props.get("choices") or []))
+            self.choices.setPlaceholderText("One choice per line")
+            self.choices.setFixedHeight(110)
+            form.addRow("Choices:", self.choices)
+            if kind == "combo":
+                self.editable = QCheckBox("Let people type their own answer")
+                self.editable.setChecked(bool(props.get("editable")))
+                form.addRow("", self.editable)
+        self.font_size = QDoubleSpinBox()
+        self.font_size.setRange(0, 72)
+        self.font_size.setDecimals(1)
+        self.font_size.setSpecialValueText("Auto")
+        self.font_size.setValue(float(props.get("font_size") or 0))
+        self.font_size.setSuffix(" pt")
+        if kind not in ("signature",):
+            form.addRow("Text size:", self.font_size)
+        from pdfdesk.fonts import rgb_to_hex
+        self.border = ColorButton(rgb_to_hex(props.get("border_color")) if props.get("border_color") else "",
+                                  "Border color", none_label="No border")
+        self.fill = ColorButton(rgb_to_hex(props.get("fill_color")) if props.get("fill_color") else "",
+                                "Background color", none_label="No background")
+        self.text_color = ColorButton(rgb_to_hex(props.get("text_color") or (0, 0, 0)), "Text color")
+        colors = QHBoxLayout()
+        for label, btn in (("Border", self.border), ("Background", self.fill), ("Text", self.text_color)):
+            colors.addWidget(QLabel(label))
+            colors.addWidget(btn)
+        colors.addStretch(1)
+        form.addRow("Colors:", self._wrap(colors))
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "OK"))
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        w.setLayout(layout)
+        return w
+
+    def validate(self) -> None:
+        if self.kind != "radio" and not self.name.text().strip():
+            raise ValueError("Give the field a name.")
+        if self.choices is not None and not self.choices.toPlainText().strip():
+            raise ValueError("Add at least one choice.")
+
+    def result_props(self) -> dict:
+        from pdfdesk.fonts import hex_to_rgb
+        p = dict(self.props)
+        p.update(name=self.name.text().strip(), tooltip=self.tooltip.text().strip(),
+                 required=self.required.isChecked(), read_only=self.read_only.isChecked(),
+                 font_size=self.font_size.value(),
+                 border_color=hex_to_rgb(self.border.color()) if self.border.color() else None,
+                 fill_color=hex_to_rgb(self.fill.color()) if self.fill.color() else None,
+                 text_color=hex_to_rgb(self.text_color.color()))
+        if p.get("border_color") is None:
+            p["border_width"] = 0
+        elif not p.get("border_width"):
+            p["border_width"] = 1
+        if self.multiline is not None:
+            p.update(multiline=self.multiline.isChecked(), max_length=self.max_length.value(),
+                     align=self.align.currentIndex())
+        if self.choices is not None:
+            p["choices"] = [c for c in self.choices.toPlainText().splitlines() if c.strip()]
+        if self.editable is not None:
+            p["editable"] = self.editable.isChecked()
+        return p
+
+
+class RadioButtonDialog(_Validated):
+    """Which group a new radio button belongs to, and the value it stands for."""
+
+    def __init__(self, parent, groups: list[str], group: str, value: str):
+        super().__init__(parent)
+        self.setWindowTitle("Radio button")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("Buttons in the same group allow only one choice. Pick a group or type a new name."))
+        form = QFormLayout()
+        self.group = QComboBox()
+        self.group.setEditable(True)
+        self.group.addItems(groups)
+        self.group.setEditText(group)
+        self.value = QLineEdit(value)
+        form.addRow("Group:", self.group)
+        form.addRow("Value of this button:", self.value)
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "Add"))
+
+    def validate(self) -> None:
+        if not self.group.currentText().strip() or not self.value.text().strip():
+            raise ValueError("Type a group name and a value.")
+
+
+class DetectedFieldsDialog(QDialog):
+    """Shows the fields PDF Desk found and lets the person untick any before adding them."""
+
+    def __init__(self, parent, found: list[tuple[int, str, object, str]]):
+        super().__init__(parent)
+        from pdfdesk import forms
+        self.setWindowTitle("Fields found")
+        self.found = found
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted(f"PDF Desk found {len(found)} place(s) that look like they need an answer. "
+                            "Untick any you don't want, then click Add."))
+        self.list = QListWidget()
+        for pno, kind, _rect, name in found:
+            item = QListWidgetItem(f"Page {pno + 1}: {forms.KIND_LABELS[kind]}  {name}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked)
+            self.list.addItem(item)
+        self.list.setMinimumSize(420, 260)
+        lay.addWidget(self.list)
+        lay.addWidget(_buttons(self, "Add fields"))
+
+    def chosen(self) -> list[tuple[int, str, object, str]]:
+        return [f for k, f in enumerate(self.found) if self.list.item(k).checkState() == Qt.CheckState.Checked]
+
+
+# =========================================================================== document features
+
+class LinkDialog(_Validated):
+    """Where a link goes: a page in this PDF or a web/e-mail address."""
+
+    def __init__(self, parent, page_count: int, current: dict | None = None, can_delete: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle("Edit link" if current else "Add link")
+        self.page_count = page_count
+        self.deleted = False
+        lay = QVBoxLayout(self)
+        self.to_page = QRadioButton("Go to a page in this PDF:")
+        self.page = QSpinBox()
+        self.page.setRange(1, max(1, page_count))
+        self.to_web = QRadioButton("Open a web page or e-mail:")
+        self.url = QLineEdit()
+        self.url.setPlaceholderText("https://example.com  or  mailto:name@example.com")
+        grid = QGridLayout()
+        grid.addWidget(self.to_page, 0, 0)
+        grid.addWidget(self.page, 0, 1)
+        grid.addWidget(self.to_web, 1, 0)
+        grid.addWidget(self.url, 1, 1)
+        lay.addLayout(grid)
+        lay.addWidget(muted("Only web (http, https) and e-mail links can be added. Links to files or programs "
+                            "aren't allowed."))
+        current = current or {}
+        if "uri" in current:
+            self.to_web.setChecked(True)
+            self.url.setText(current["uri"])
+        else:
+            self.to_page.setChecked(True)
+            self.page.setValue(int(current.get("page", 0)) + 1)
+        self.url.textEdited.connect(lambda _t: self.to_web.setChecked(True))
+        self.page.valueChanged.connect(lambda _v: self.to_page.setChecked(True))
+        buttons = _buttons(self, "OK")
+        if can_delete:
+            delete = buttons.addButton("Delete link", QDialogButtonBox.ButtonRole.DestructiveRole)
+            delete.clicked.connect(self._delete)
+        lay.addWidget(buttons)
+        self.resize(460, 0)
+
+    def _delete(self) -> None:
+        self.deleted = True
+        QDialog.accept(self)
+
+    def validate(self) -> None:
+        if self.to_web.isChecked():
+            from pdfdesk import safety
+            text = self.url.text().strip()
+            if text and "://" not in text and not text.lower().startswith("mailto:"):
+                text = ("mailto:" + text) if "@" in text and "/" not in text else "https://" + text
+                self.url.setText(text)
+            url, info = safety.check_web_link(text)
+            if url is None:
+                raise ValueError(info)
+
+    def target(self) -> dict:
+        if self.to_web.isChecked():
+            return {"uri": self.url.text().strip()}
+        return {"page": self.page.value() - 1}
+
+
+class PageLabelsDialog(_Validated):
+    """Page numbering as shown in viewers (i, ii, iii for a preface, then 1, 2, 3...)."""
+
+    def __init__(self, parent, page_count: int, rules: list[dict]):
+        super().__init__(parent)
+        from pdfdesk.docfeatures import LABEL_STYLES
+        self.setWindowTitle("Page labels")
+        self.page_count = page_count
+        self.styles = LABEL_STYLES
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("Each row starts a new numbering style from its first page. For example: pages 1-4 "
+                            "as i, ii, iii, iv and from page 5 on as 1, 2, 3."))
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["From page", "Style", "Prefix", "Start at"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        lay.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add range")
+        add.clicked.connect(lambda: self._add_row({"startpage": self._next_start(), "style": "D", "firstpagenum": 1}))
+        remove = QPushButton("Remove range")
+        remove.clicked.connect(lambda: self.table.removeRow(self.table.currentRow())
+                               if self.table.currentRow() >= 0 else None)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch(1)
+        lay.addLayout(row)
+        for r in rules or [{"startpage": 0, "style": "D", "firstpagenum": 1}]:
+            self._add_row(r)
+        lay.addWidget(_buttons(self, "Apply"))
+        self.resize(560, 360)
+
+    def _next_start(self) -> int:
+        starts = [self.table.cellWidget(r, 0).value() for r in range(self.table.rowCount())]
+        return min(self.page_count - 1, max(starts)) if starts else 0  # the page after the last range start
+
+    def _add_row(self, rule: dict) -> None:
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        start = QSpinBox()
+        start.setRange(1, max(1, self.page_count))
+        start.setValue(max(1, min(self.page_count, int(rule.get("startpage", 0)) + 1)))
+        style = QComboBox()
+        for code, label in self.styles:
+            style.addItem(label, code)
+        idx = style.findData(rule.get("style", "D"))
+        style.setCurrentIndex(idx if idx >= 0 else 0)
+        prefix = QLineEdit(str(rule.get("prefix", "")))
+        first = QSpinBox()
+        first.setRange(1, 100000)
+        try:
+            first.setValue(max(1, min(100000, int(rule.get("firstpagenum", 1)))))
+        except (TypeError, ValueError, OverflowError):
+            first.setValue(1)
+        for c, w in enumerate((start, style, prefix, first)):
+            self.table.setCellWidget(r, c, w)
+
+    def rules(self) -> list[dict]:
+        out = []
+        for r in range(self.table.rowCount()):
+            out.append({"startpage": self.table.cellWidget(r, 0).value() - 1,
+                        "style": self.table.cellWidget(r, 1).currentData(),
+                        "prefix": self.table.cellWidget(r, 2).text(),
+                        "firstpagenum": self.table.cellWidget(r, 3).value()})
+        return out
+
+    def validate(self) -> None:
+        starts = [r["startpage"] for r in self.rules()]
+        if len(set(starts)) != len(starts):
+            raise ValueError("Two ranges start on the same page.")
+
+
+class BackgroundDialog(_Validated):
+    def __init__(self, parent, pdf: PdfDocument, current: int):
+        super().__init__(parent)
+        self.setWindowTitle("Page background")
+        self.pdf = pdf
+        self.current = current
+        outer = QHBoxLayout(self)
+        left = QVBoxLayout()
+        form = QFormLayout()
+        self.use_color = QRadioButton("Color:")
+        self.use_color.setChecked(True)
+        self.color = ColorButton("#fff6d5", "Background color")
+        self.use_image = QRadioButton("Picture:")
+        self.image = PathPicker("open", "Choose a picture", "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tif *.tiff)")
+        self.stretch = QCheckBox("Stretch to fill the page")
+        self.opacity = QSlider(Qt.Orientation.Horizontal)
+        self.opacity.setRange(5, 100)
+        self.opacity.setValue(100)
+        self.range = PageRangeEdit(pdf.page_count, current)
+        form.addRow(self.use_color, self.color)
+        form.addRow(self.use_image, self.image)
+        form.addRow("", self.stretch)
+        form.addRow("Opacity:", self.opacity)
+        form.addRow("Pages:", self.range)
+        left.addLayout(form)
+        left.addWidget(muted("The background goes behind everything on the page. Undo removes it."))
+        left.addStretch(1)
+        left.addWidget(_buttons(self, "Add background"))
+        outer.addLayout(left, 1)
+        self.preview = _preview_label()
+        outer.addWidget(self.preview)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(200)
+        self._timer.timeout.connect(self._update_preview)
+        for sig in (self.color.color_changed, self.use_color.toggled, self.image.changed, self.stretch.toggled,
+                    self.opacity.valueChanged):
+            sig.connect(lambda *_: self._timer.start())
+        self.image.changed.connect(lambda _p: self.use_image.setChecked(True))
+        self._timer.start(0)
+
+    def _image_bytes(self) -> bytes | None:
+        path = self.image.path()
+        if self.use_image.isChecked() and os.path.isfile(path):
+            from pdfdesk.convert import _image_bytes_for_mupdf
+            data = _image_bytes_for_mupdf(Path(path).read_bytes())
+            if self.opacity.value() < 100:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(data)).convert("RGBA")
+                alpha = img.getchannel("A").point(lambda a: int(a * self.opacity.value() / 100))
+                img.putalpha(alpha)
+                buf = io.BytesIO()
+                img.save(buf, "PNG")
+                data = buf.getvalue()
+            return data
+        return None
+
+    def apply(self, doc: fitz.Document, pages: list[int]) -> None:
+        from pdfdesk import docfeatures
+        if self.use_color.isChecked():
+            docfeatures.add_background(doc, pages, color=hex_to_rgb(self.color.color()),
+                                       opacity=self.opacity.value() / 100)
+        else:
+            docfeatures.add_background(doc, pages, image=self._image_bytes(),
+                                       fit="stretch" if self.stretch.isChecked() else "fit")
+
+    def _update_preview(self) -> None:
+        try:
+            tmp = fitz.open("pdf", pdfops.extract_pages_bytes(self.pdf.doc, [self.current]))
+            if self.use_color.isChecked() or self._image_bytes():
+                self.apply(tmp, [0])
+            _render_preview(tmp, self.preview)
+        except Exception:
+            pass
+
+    def validate(self) -> None:
+        self._pages = self.range.pages()
+        if self.use_image.isChecked() and not os.path.isfile(self.image.path()):
+            raise ValueError("Choose a picture for the background.")
+
+
+class PageSizeDialog(_Validated):
+    def __init__(self, parent, pdf: PdfDocument, current: int):
+        super().__init__(parent)
+        from pdfdesk.docfeatures import PAPER_SIZES
+        self.setWindowTitle("Page size")
+        self.sizes = PAPER_SIZES
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        cur = pdf.page_rect(current)
+        form.addRow("Current page:", ui.plain_label(pdfops.page_size_text(cur)))
+        self.paper = QComboBox()
+        for name, w, h in PAPER_SIZES:
+            self.paper.addItem(f"{name} ({w / 72:.2f} x {h / 72:.2f} in)", (w, h))
+        self.paper.addItem("Custom size", None)
+        self.paper.setCurrentIndex(0 if cur.width < 600 or cur.width > 620 else 4)
+        self.width = QDoubleSpinBox()
+        self.height = QDoubleSpinBox()
+        for spin in (self.width, self.height):
+            spin.setRange(1, 200)
+            spin.setDecimals(2)
+            spin.setSuffix(" in")
+        self.landscape = QCheckBox("Landscape")
+        self.mode = QComboBox()
+        self.mode.addItems(["Shrink or enlarge the content to fit", "Keep the content size (change the margins)"])
+        self.range = PageRangeEdit(pdf.page_count, current)
+        custom = QHBoxLayout()
+        custom.addWidget(self.width)
+        custom.addWidget(QLabel("x"))
+        custom.addWidget(self.height)
+        custom.addWidget(self.landscape)
+        form.addRow("New size:", self.paper)
+        form.addRow("", self._wrap(custom))
+        form.addRow("Content:", self.mode)
+        form.addRow("Pages:", self.range)
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "Change size"))
+        self.paper.currentIndexChanged.connect(self._paper_changed)
+        self._paper_changed()
+
+    @staticmethod
+    def _wrap(layout) -> QWidget:
+        w = QWidget()
+        layout.setContentsMargins(0, 0, 0, 0)
+        w.setLayout(layout)
+        return w
+
+    def _paper_changed(self, *_):
+        data = self.paper.currentData()
+        custom = data is None
+        self.width.setEnabled(custom)
+        self.height.setEnabled(custom)
+        if data:
+            self.width.setValue(data[0] / 72)
+            self.height.setValue(data[1] / 72)
+
+    def size_pt(self) -> tuple[float, float]:
+        w, h = self.width.value() * 72, self.height.value() * 72
+        if self.landscape.isChecked():
+            w, h = max(w, h), min(w, h)
+        else:
+            w, h = min(w, h), max(w, h)
+        return w, h
+
+    def validate(self) -> None:
+        self._pages = self.range.pages()
+
+    def mode_key(self) -> str:
+        return "scale" if self.mode.currentIndex() == 0 else "margins"
+
+
+class PrintLayoutDialog(_Validated):
+    """Pages per sheet (N-up) or a folded booklet, made as a new PDF."""
+
+    def __init__(self, parent, booklet: bool = False):
+        super().__init__(parent)
+        from pdfdesk.docfeatures import PAPER_SIZES
+        self.setWindowTitle("Booklet" if booklet else "Pages per sheet")
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.kind = QComboBox()
+        for n in (2, 4, 6, 9, 16):
+            self.kind.addItem(f"{n} pages per sheet", n)
+        self.kind.addItem("Booklet (fold in half, staple in the middle)", "booklet")
+        self.kind.setCurrentIndex(self.kind.count() - 1 if booklet else 0)
+        self.paper = QComboBox()
+        for name, w, h in PAPER_SIZES:
+            self.paper.addItem(name, (w, h))
+        self.paper.setCurrentIndex(0)
+        self.landscape = QCheckBox("Landscape sheets")
+        self.landscape.setChecked(True)
+        self.borders = QCheckBox("Draw a thin border around each page")
+        form.addRow("Layout:", self.kind)
+        form.addRow("Sheet size:", self.paper)
+        form.addRow("", self.landscape)
+        form.addRow("", self.borders)
+        lay.addLayout(form)
+        lay.addWidget(muted("A new PDF is made; this one isn't changed. Comments and form entries are printed "
+                            "into the pages. For a booklet, print both sides and flip on the short edge."))
+        lay.addWidget(_buttons(self, "Make PDF"))
+        self.kind.currentIndexChanged.connect(lambda _i: self.landscape.setEnabled(self.kind.currentData() != "booklet"))
+
+    def params(self) -> dict:
+        w, h = self.paper.currentData()
+        if self.landscape.isChecked() or self.kind.currentData() == "booklet":
+            w, h = max(w, h), min(w, h)
+        return {"kind": self.kind.currentData(), "paper": (w, h), "borders": self.borders.isChecked()}
+
+
+
+class MeasureScaleDialog(QDialog):
+    """The drawing scale used by the Measure tool, like "1 in = 10 ft" on a floor plan."""
+
+    def __init__(self, parent, scale):
+        super().__init__(parent)
+        from pdfdesk import measure
+        self.setWindowTitle("Measuring scale")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("How long is something on the page compared to the real thing? For a plan drawn at "
+                            "1:100, use 1 cm = 1 m. For a normal document, use 1 in = 1 in."))
+        row = QHBoxLayout()
+        self.page_value = QDoubleSpinBox()
+        self.page_value.setRange(0.001, 100000)
+        self.page_value.setDecimals(3)
+        self.page_value.setValue(scale.page_value)
+        self.page_unit = QComboBox()
+        self.page_unit.addItems(list(measure.PAGE_UNITS))
+        self.page_unit.setCurrentText(scale.page_unit)
+        self.real_value = QDoubleSpinBox()
+        self.real_value.setRange(0.000001, 1e9)
+        self.real_value.setDecimals(3)
+        self.real_value.setValue(scale.real_value)
+        self.real_unit = QComboBox()
+        self.real_unit.addItems(measure.REAL_UNITS)
+        self.real_unit.setCurrentText(scale.real_unit)
+        for w in (self.page_value, self.page_unit, QLabel("on the page  ="), self.real_value, self.real_unit):
+            row.addWidget(w)
+        lay.addLayout(row)
+        form = QFormLayout()
+        self.decimals = QSpinBox()
+        self.decimals.setRange(0, 4)
+        self.decimals.setValue(scale.decimals)
+        form.addRow("Decimal places:", self.decimals)
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "OK"))
+
+    def scale(self):
+        from pdfdesk.measure import Scale
+        return Scale(self.page_value.value(), self.page_unit.currentText(), self.real_value.value(),
+                     self.real_unit.currentText(), self.decimals.value())
+
+
+# =========================================================================== digital IDs
+
+class CreateIdDialog(_Validated):
+    def __init__(self, parent, author: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Create a Digital ID")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("A Digital ID lets you sign PDFs so others can see who signed and that nothing changed "
+                            "afterwards. This one is made on your computer (self-signed): people who receive your "
+                            "documents can choose to trust it. It is protected by the password below."))
+        form = QFormLayout()
+        self.name = QLineEdit(author)
+        self.email = QLineEdit()
+        self.org = QLineEdit()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password2 = QLineEdit()
+        self.password2.setEchoMode(QLineEdit.EchoMode.Password)
+        self.years = QSpinBox()
+        self.years.setRange(1, 20)
+        self.years.setValue(5)
+        self.years.setSuffix(" years")
+        form.addRow("Your name:", self.name)
+        form.addRow("E-mail:", self.email)
+        form.addRow("Organization:", self.org)
+        form.addRow("Password:", self.password)
+        form.addRow("Password again:", self.password2)
+        form.addRow("Valid for:", self.years)
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "Create"))
+        self.resize(460, 0)
+
+    def validate(self) -> None:
+        if not self.name.text().strip():
+            raise ValueError("Type your name.")
+        if len(self.password.text()) < 8:
+            raise ValueError("Use a password of at least 8 characters.")
+        if self.password.text() != self.password2.text():
+            raise ValueError("The two passwords are different.")
+
+    def clear_passwords(self) -> None:
+        self.password.clear()
+        self.password2.clear()
+
+
+class NewPasswordDialog(_Validated):
+    """Choose a new password for a Digital ID being imported."""
+
+    def __init__(self, parent, message: str):
+        super().__init__(parent)
+        self.setWindowTitle("New password")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted(message))
+        form = QFormLayout()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password2 = QLineEdit()
+        self.password2.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("New password:", self.password)
+        form.addRow("Password again:", self.password2)
+        lay.addLayout(form)
+        lay.addWidget(_buttons(self, "OK"))
+        self.resize(420, 0)
+
+    def validate(self) -> None:
+        if len(self.password.text()) < 8:
+            raise ValueError("Use a password of at least 8 characters.")
+        if self.password.text() != self.password2.text():
+            raise ValueError("The two passwords are different.")
+
+
+class DigitalIdsDialog(QDialog):
+    """Your Digital IDs, and the certificates of people you trust."""
+
+    def __init__(self, parent, author: str = ""):
+        super().__init__(parent)
+        from pdfdesk import digitalid
+        self.di = digitalid
+        self.author = author
+        self.setWindowTitle("Digital IDs")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("Your Digital IDs are kept in PDF Desk's settings folder, readable only by you, and "
+                            "each is locked with its own password. Nothing is sent anywhere."))
+        self.list = QListWidget()
+        self.list.setMinimumSize(520, 200)
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        for text, fn in (("Create new ID...", self._create), ("Import .p12 / .pfx...", self._import),
+                         ("Export certificate...", self._export), ("Delete", self._delete)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.trust_label = muted("")
+        lay.addWidget(self.trust_label)
+        trust_row = QHBoxLayout()
+        add_trust = QPushButton("Trust a certificate from a file...")
+        add_trust.clicked.connect(self._add_trust)
+        trust_row.addWidget(add_trust)
+        trust_row.addStretch(1)
+        lay.addLayout(trust_row)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.rejected.connect(self.reject)
+        box.accepted.connect(self.accept)
+        lay.addWidget(box)
+        self.reload()
+
+    def reload(self) -> None:
+        self.list.clear()
+        for info in self.di.list_ids():
+            kind = "self-made" if info["self_signed"] else f"issued by {info['issuer']}"
+            text = (f"{info['name']}" + (f"  <{info['email']}>" if info["email"] else "")
+                    + f"\n{kind}, valid until {info['not_after'].date().isoformat()}")
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, info)
+            self.list.addItem(item)
+        if not self.list.count():
+            item = QListWidgetItem("No Digital IDs yet. Create one or import one.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list.addItem(item)
+        n = len(list(self.di.trusted_dir().glob("*.crt")))
+        self.trust_label.setText(f"You trust {n} certificate(s). Signatures made with them show as confirmed.")
+
+    def current(self) -> dict | None:
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _create(self) -> None:
+        dlg = CreateIdDialog(self, self.author)
+        try:
+            if dlg.exec():
+                try:
+                    self.di.create_id(dlg.name.text(), dlg.email.text(), dlg.org.text(), dlg.password.text(),
+                                      dlg.years.value())
+                except Exception as exc:
+                    ui.warning(self, "Create a Digital ID", str(exc))
+        finally:
+            dlg.clear_passwords()
+            dlg.deleteLater()
+        self.reload()
+
+    def _import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Import a Digital ID", "", "Digital IDs (*.p12 *.pfx)")
+        if not path:
+            return
+        from PySide6.QtWidgets import QInputDialog
+        pw, ok = QInputDialog.getText(self, "Import a Digital ID", "Password of this Digital ID:",
+                                      QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+        try:
+            try:
+                self.di.import_id(path, pw)
+            except self.di.ShortPassword as short:
+                dlg = NewPasswordDialog(self, f"{short} PDF Desk keeps it locked with the new password; the "
+                                              "original file is not changed.")
+                try:
+                    if not dlg.exec():
+                        return
+                    self.di.import_id(path, pw, dlg.password.text())
+                finally:
+                    dlg.password.clear()
+                    dlg.password2.clear()
+                    dlg.deleteLater()
+        except Exception as exc:
+            ui.warning(self, "Import a Digital ID", str(exc))
+        finally:
+            self.reload()
+
+    def _export(self) -> None:
+        info = self.current()
+        if not info:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export certificate (safe to share)",
+                                              f"{info['name']} certificate.cer", "Certificates (*.cer *.crt *.pem)")
+        if path:
+            try:
+                self.di.export_certificate(info["cert_path"], path)
+            except Exception as exc:
+                ui.warning(self, "Export certificate", str(exc))
+
+    def _delete(self) -> None:
+        info = self.current()
+        if not info:
+            return
+        if ui.question(self, "Delete Digital ID", f"Delete the Digital ID of {info['name']}? You won't be able to "
+                                                  "sign with it again. Signatures already made stay valid.",
+                       default=ui.No) == ui.Yes:
+            try:
+                self.di.delete_id(info["path"])
+            except Exception as exc:
+                ui.warning(self, "Delete Digital ID", str(exc))
+            self.reload()
+
+    def _add_trust(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Trust a certificate", "", "Certificates (*.cer *.crt *.pem *.der)")
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()[:200000]
+            self.di.trust_certificate(data)
+        except Exception as exc:
+            ui.warning(self, "Trust a certificate", f"That file isn't a certificate:\n\n{exc}")
+        self.reload()
+
+
+class SignDialog(_Validated):
+    def __init__(self, parent, ids: list[dict], default_path: str, has_image: bool, last_reason: str = "",
+                 last_location: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Sign with Digital ID")
+        self.ids = ids
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.id_box = QComboBox()
+        for info in ids:
+            self.id_box.addItem(f"{info['name']}" + (f" <{info['email']}>" if info["email"] else ""), info["path"])
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.reason = QComboBox()
+        self.reason.setEditable(True)
+        self.reason.addItems(["I approve this document", "I am the author of this document",
+                              "I have reviewed this document", "I agree to the terms"])
+        self.reason.setEditText(last_reason or "I approve this document")
+        self.location = QLineEdit(last_location)
+        self.with_image = QCheckBox("Include my handwritten signature in the box")
+        self.with_image.setChecked(has_image)
+        self.with_image.setEnabled(has_image)
+        self.target = PathPicker("save", "Save the signed PDF as", "PDF files (*.pdf)")
+        self.target.set_path(default_path)
+        form.addRow("Digital ID:", self.id_box)
+        form.addRow("Password:", self.password)
+        form.addRow("Reason:", self.reason)
+        form.addRow("Location:", self.location)
+        form.addRow("", self.with_image)
+        form.addRow("Save as:", self.target)
+        lay.addLayout(form)
+        lay.addWidget(muted("Signing saves a new copy of the PDF. Any later change to the signed copy shows up "
+                            "when the signature is checked. The signing time is taken from this computer's clock."))
+        lay.addWidget(_buttons(self, "Sign"))
+        self.resize(520, 0)
+
+    def validate(self) -> None:
+        from pdfdesk import digitalid
+        if not self.password.text():
+            raise ValueError("Type the password of your Digital ID.")
+        if not digitalid.check_password(self.id_box.currentData(), self.password.text()):
+            raise ValueError("That password doesn't open this Digital ID.")
+        path = self.target.path()
+        if not path:
+            raise ValueError("Choose where to save the signed PDF.")
+        if not path.lower().endswith(".pdf"):
+            self.target.set_path(path + ".pdf")
+
+
+class SignaturesDialog(QDialog):
+    """Results of checking the digital signatures in a PDF."""
+
+    def __init__(self, parent, results: list[dict], on_open_version=None):
+        super().__init__(parent)
+        from pdfdesk import digitalid
+        self.di = digitalid
+        self.results = results
+        self.on_open_version = on_open_version
+        self.setWindowTitle("Digital signatures")
+        lay = QVBoxLayout(self)
+        lay.addWidget(muted("Checked on this computer only: certificates are compared with the ones you trust, "
+                            "and nothing is downloaded. Text in quotes was written by the signer."))
+        self.list = QListWidget()
+        self.list.setWordWrap(True)
+        self.list.setMinimumSize(600, 260)
+        colors = {"good": "#2a9d4a", "warn": "#d08a00", "bad": "#c8323c"}
+        verdicts = {"good": "VALID", "warn": "VALID, WITH NOTES", "bad": "NOT VALID"}
+        from PySide6.QtGui import QColor, QIcon, QPixmap
+        for item in results:
+            level, text = digitalid.describe(item)
+            extra = []
+            if item.get("reason"):
+                extra.append(f"Signer's reason: \u201c{item['reason']}\u201d")
+            if item.get("location"):
+                extra.append(f"Signer's location: \u201c{item['location']}\u201d")
+            if item.get("email"):
+                extra.append(f"E-mail in the certificate: {item['email']}")
+            head = f"{item.get('field') or 'Signature'}: {verdicts[level]}"
+            row = QListWidgetItem(f"{head}\n{text}" + ("\n" + "\n".join(extra) if extra else ""))
+            pm = QPixmap(14, 14)
+            pm.fill(QColor(colors[level]))
+            row.setIcon(QIcon(pm))
+            row.setData(Qt.ItemDataRole.UserRole, item)
+            self.list.addItem(row)
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        self.trust_btn = QPushButton("Trust this signer's certificate")
+        self.trust_btn.clicked.connect(self._trust)
+        row.addWidget(self.trust_btn)
+        self.version_btn = QPushButton("Open signed version")
+        self.version_btn.setToolTip("Open the document exactly as it was when the selected signature was made")
+        self.version_btn.clicked.connect(self._open_version)
+        self.version_btn.setVisible(on_open_version is not None)
+        row.addWidget(self.version_btn)
+        row.addStretch(1)
+        close = QPushButton("Close")
+        close.clicked.connect(self.accept)
+        row.addWidget(close)
+        lay.addLayout(row)
+        self.trusted_any = False
+        self.list.currentItemChanged.connect(self._selection_changed)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def _selected(self) -> dict | None:
+        item = self.list.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def _selection_changed(self, *_a) -> None:
+        data = self._selected() or {}
+        self.version_btn.setEnabled(bool(data.get("changed_after") and data.get("signed_end")))
+        self.trust_btn.setEnabled(bool(data.get("certificate")) and not data.get("trusted"))
+
+    def _open_version(self) -> None:
+        data = self._selected()
+        if data and self.on_open_version is not None:
+            try:
+                self.on_open_version(data)
+            except Exception as exc:
+                ui.warning(self, "Open signed version", str(exc))
+                return
+            self.accept()
+
+    def _trust(self) -> None:
+        data = self._selected()
+        if not data or not data.get("certificate"):
+            ui.information(self, "Trust certificate", "Select a signature first.")
+            return
+        if ui.question(self, "Trust certificate",
+                       f"Trust signatures made by {data['name']} from now on?\n\nOnly do this if you know the "
+                       "certificate really belongs to them (for example, they sent it to you directly).",
+                       default=ui.No) != ui.Yes:
+            return
+        try:
+            self.di.trust_certificate(data["certificate"])
+        except Exception as exc:
+            ui.warning(self, "Trust certificate", str(exc))
+            return
+        self.trusted_any = True
+        self.accept()

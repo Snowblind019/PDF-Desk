@@ -10,8 +10,12 @@ is_windows = sys.platform.startswith("win")
 datas = [("pdfdesk/icons", "pdfdesk/icons"), ("pdfdesk/assets", "pdfdesk/assets")]
 binaries = []
 hiddenimports = ["fitz", "pdfdesk.mainwindow"]
-for pkg in ("pymupdf", "pymupdf_fonts", "docx", "pptx", "openpyxl", "pdf2docx"):
-    d, b, h = collect_all(pkg)
+for pkg in ("pymupdf", "pymupdf_fonts", "docx", "pptx", "openpyxl", "pdf2docx", "fontTools", "pyhanko",
+            "pyhanko_certvalidator", "asn1crypto", "cryptography", "tzlocal", "tzdata"):
+    try:
+        d, b, h = collect_all(pkg)
+    except Exception:  # an optional package that isn't installed on this system (such as tzdata on Linux)
+        continue
     datas += d
     binaries += b
     hiddenimports += h

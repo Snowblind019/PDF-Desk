@@ -290,9 +290,11 @@ def add_image_watermark(doc: fitz.Document, pages: Iterable[int], image_path: st
         page.insert_image(box, stream=data, overlay=not behind, rotate=page.rotation)
 
 
-def expand_tokens(text: str, page_num: int, total: int, filename: str = "", title: str = "") -> str:
+def expand_tokens(text: str, page_num: int, total: int, filename: str = "", title: str = "",
+                  bates: str = "") -> str:
     today = _dt.date.today()
-    return (text.replace("{page}", str(page_num))
+    return (text.replace("{bates}", bates)
+                .replace("{page}", str(page_num))
                 .replace("{pages}", str(total))
                 .replace("{date}", today.isoformat())
                 .replace("{filename}", filename)
@@ -301,8 +303,10 @@ def expand_tokens(text: str, page_num: int, total: int, filename: str = "", titl
 
 def add_header_footer(doc: fitz.Document, pages: Iterable[int], slots: dict, size: float = 10,
                       color=(0, 0, 0), margin: float = 28, start_number: int = 1,
-                      family: str = "sans", filename: str = "", count_from_selection: bool = False) -> None:
-    """slots keys: header_left/center/right, footer_left/center/right. Tokens: {page} {pages} {date} {filename} {title}."""
+                      family: str = "sans", filename: str = "", count_from_selection: bool = False,
+                      bates_prefix: str = "", bates_start: int = 1, bates_digits: int = 6) -> None:
+    """slots keys: header_left/center/right, footer_left/center/right.
+    Tokens: {page} {pages} {date} {filename} {title} {bates} (Bates number: prefix + zero-padded counter)."""
     pages = list(pages)
     title = doc.metadata.get("title") or ""
     total = (len(pages) if count_from_selection else doc.page_count) + start_number - 1
@@ -313,7 +317,8 @@ def add_header_footer(doc: fitz.Document, pages: Iterable[int], slots: dict, siz
         for key, raw in slots.items():
             if not raw:
                 continue
-            text = expand_tokens(raw, number, total, filename, title)
+            bates = f"{bates_prefix}{bates_start + n:0{max(1, min(12, int(bates_digits)))}d}"
+            text = expand_tokens(raw, number, total, filename, title, bates)
             w = fonts.text_width(text, size, family)
             y = margin + size if key.startswith("header") else vis.height - margin
             if key.endswith("left"):
@@ -521,14 +526,43 @@ def apply_redactions(doc: fitz.Document) -> int:
 
 # --------------------------------------------------------------------------- edit text
 
+def _annot_refs(doc: fitz.Document, page: fitz.Page) -> list[tuple[str, str]]:
+    t, v = doc.xref_get_key(page.xref, "Annots")
+    if t == "xref":
+        v = doc.xref_object(int(v.split()[0]))
+    elif t != "array":
+        return []
+    return re.findall(r"(\d+)\s+(\d+)\s+R", v[:2_000_000])
+
+
+def remove_text(page: fitz.Page, rects) -> fitz.Page:
+    """Delete only the text inside `rects` (unrotated page coordinates), keeping pictures, drawings and
+    any redaction marks the person made themselves (applying redactions would otherwise apply those
+    too). Returns the page object to keep using."""
+    doc = page.parent
+    pending = {str(a.xref) for a in page.annots(types=[fitz.PDF_ANNOT_REDACT])}
+    if pending:
+        refs = _annot_refs(doc, page)
+        keep = [(n, g) for n, g in refs if n not in pending]
+        doc.xref_set_key(page.xref, "Annots", "[" + " ".join(f"{n} {g} R" for n, g in keep) + "]")
+        page = doc.reload_page(page)
+    for r in rects:
+        page.add_redact_annot(fitz.Rect(r), fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                          text=fitz.PDF_REDACT_TEXT_REMOVE)
+    if pending:
+        refs = _annot_refs(doc, page) + [(n, g) for n, g in refs if n in pending]
+        doc.xref_set_key(page.xref, "Annots", "[" + " ".join(f"{n} {g} R" for n, g in refs) + "]")
+        page = doc.reload_page(page)
+    return page
+
+
 def replace_text_line(page: fitz.Page, bbox: fitz.Rect, origin: fitz.Point, new_text: str,
                       size: float, color, family: str, bold: bool, italic: bool) -> None:
     """Remove the text inside bbox and write new_text at origin (both unrotated page coords)."""
     shrink = bbox.height * 0.15
     area = fitz.Rect(bbox.x0, bbox.y0 + shrink, bbox.x1, bbox.y1 - shrink)
-    page.add_redact_annot(area, fill=False)
-    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE,
-                          text=fitz.PDF_REDACT_TEXT_REMOVE)
+    page = remove_text(page, [area])
     if new_text.strip():
         fonts.insert_text(page, origin, new_text, size=size, color=color, family=family,
                           bold=bold, italic=italic, rotate=page.rotation)

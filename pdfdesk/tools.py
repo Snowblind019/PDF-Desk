@@ -23,6 +23,17 @@ IMAGE = "image"
 SIGNATURE = "signature"
 REDACT = "redact"
 EDIT_TEXT = "edit_text"
+FILLSIGN = "fillsign"
+LINK = "link"
+MEASURE = "measure"
+DIGISIGN = "digisign"
+SNAPSHOT = "snapshot"
+FIELD_TEXT = "field_text"
+FIELD_CHECK = "field_check"
+FIELD_RADIO = "field_radio"
+FIELD_COMBO = "field_combo"
+FIELD_LIST = "field_list"
+FIELD_SIGNATURE = "field_signature"
 
 # tool: (label, icon, help text)
 TOOLS = {
@@ -41,16 +52,36 @@ TOOLS = {
     STAMP: ("Stamp", "stamp", "Click or drag to place a stamp"),
     IMAGE: ("Image", "image", "Click or drag a box, then pick an image to place"),
     SIGNATURE: ("Signature", "signature", "Click or drag to place your signature"),
+    FILLSIGN: ("Fill & Sign", "file-pen-line", "Click to fill in a form that has no fields: text, check marks, dates..."),
+    FIELD_TEXT: ("Text field", "text-cursor-input", "Drag a box (or click) to add a text field"),
+    FIELD_CHECK: ("Check box", "square-check", "Click to add a check box"),
+    FIELD_RADIO: ("Radio button", "circle-dot", "Click to add a radio button (buttons in a group allow one choice)"),
+    FIELD_COMBO: ("Drop-down", "square-chevron-down", "Drag a box (or click) to add a drop-down list"),
+    FIELD_LIST: ("List box", "list", "Drag a box (or click) to add a list box"),
+    FIELD_SIGNATURE: ("Signature field", "signature", "Drag a box (or click) to add a place for a digital signature"),
     REDACT: ("Redact", "eye-off", "Drag across text or draw a box to mark it for redaction"),
-    EDIT_TEXT: ("Edit text", "pencil-line", "Click a line of text to change it"),
+    LINK: ("Link", "link", "Drag a box to make a link; click a link to change or delete it"),
+    MEASURE: ("Measure", "ruler", "Drag to measure a distance; for areas click each corner and double-click to finish"),
+    SNAPSHOT: ("Snapshot", "camera", "Drag a box to copy that part of the page as a picture"),
+    DIGISIGN: ("Digital signature", "badge-check", "Drag a box where your digital signature should appear"),
+    EDIT_TEXT: ("Edit text", "pencil-line", "Click a paragraph to change its words, font, size or color"),
 }
 
 TEXT_TOOLS = {HIGHLIGHT, UNDERLINE, STRIKEOUT, REDACT}
-COLOR_TOOLS = {HIGHLIGHT, UNDERLINE, STRIKEOUT, NOTE, TEXTBOX, PEN, RECT, ELLIPSE, LINE, ARROW}
+COLOR_TOOLS = {HIGHLIGHT, UNDERLINE, STRIKEOUT, NOTE, PEN, RECT, ELLIPSE, LINE, ARROW, FILLSIGN, MEASURE}
 WIDTH_TOOLS = {PEN, RECT, ELLIPSE, LINE, ARROW}
 OPACITY_TOOLS = {HIGHLIGHT, UNDERLINE, STRIKEOUT, PEN, RECT, ELLIPSE, LINE, ARROW}
-FONT_TOOLS = {TEXTBOX}
+FONT_TOOLS = {TEXTBOX, EDIT_TEXT}
 FILL_TOOLS = {RECT, ELLIPSE, TEXTBOX}
+
+FIELD_TOOLS = {FIELD_TEXT: "text", FIELD_CHECK: "check", FIELD_RADIO: "radio", FIELD_COMBO: "combo",
+               FIELD_LIST: "list", FIELD_SIGNATURE: "signature"}
+
+FILLSIGN_MODES = [("text", "Text", "type"), ("check", "Check mark", "check"), ("cross", "Cross", "x"),
+                  ("dot", "Dot", "circle"), ("date", "Today's date", "calendar"), ("initials", "Initials", "case-sensitive")]
+
+TEXT_STYLE_DEFAULTS = {"font": "", "bold": False, "italic": False, "underline": False, "strike": False,
+                       "align": "left", "highlight": None, "spacing": 1.0}
 
 
 class ToolOptions(QObject):
@@ -145,3 +176,80 @@ class ToolOptions(QObject):
     @property
     def author(self) -> str:
         return self.settings.get("author") or ""
+
+    # ---- text formatting for new text boxes (like the defaults in Word)
+    def text_style(self) -> dict:
+        stored = self.settings.get("text_style")
+        style = dict(TEXT_STYLE_DEFAULTS)
+        if isinstance(stored, dict):
+            for key in TEXT_STYLE_DEFAULTS:
+                if key in stored:
+                    style[key] = stored[key]
+        from pdfdesk import fontcatalog
+        style["font"] = fontcatalog.catalog().resolve(style.get("font") or None)
+        style["size"] = self.font_size
+        style["color"] = self.color_hex(TEXTBOX)
+        return style
+
+    def set_text_style(self, change: dict) -> None:
+        stored = self.settings.get("text_style")
+        stored = dict(stored) if isinstance(stored, dict) else {}
+        for key, value in change.items():
+            if key == "size":
+                self.settings.set("font_size", float(value))
+            elif key == "grow":
+                from pdfdesk.richtext import SIZES
+                size = self.font_size
+                new = (next((s for s in SIZES if s > size + 0.01), size) if value > 0
+                       else next((s for s in reversed(SIZES) if s < size - 0.01), size))
+                self.settings.set("font_size", float(new))
+            elif key == "color":
+                self.settings.set_tool_color(TEXTBOX, value)
+            elif key == "clear":
+                stored = {"font": stored.get("font", "")}
+            elif key in TEXT_STYLE_DEFAULTS:
+                stored[key] = value
+        self.settings.set("text_style", stored)
+        self.changed.emit()
+
+    @property
+    def measure_mode(self) -> str:
+        mode = self.settings.get("measure_mode") or "distance"
+        return mode if mode in ("distance", "perimeter", "area") else "distance"
+
+    def set_measure_mode(self, mode: str) -> None:
+        self.settings.set("measure_mode", mode)
+        self.changed.emit()
+
+    def measure_scale(self):
+        from pdfdesk.measure import Scale
+        return Scale.from_settings(self.settings.get("measure_scale"))
+
+    def set_measure_scale(self, scale) -> None:
+        self.settings.set("measure_scale", scale.to_dict())
+        self.changed.emit()
+
+    @property
+    def fillsign_mode(self) -> str:
+        mode = self.settings.get("fillsign_mode") or "text"
+        return mode if mode in {m for m, _l, _i in FILLSIGN_MODES} else "text"
+
+    def set_fillsign_mode(self, mode: str) -> None:
+        self.settings.set("fillsign_mode", mode)
+        self.changed.emit()
+
+    @property
+    def initials(self) -> str:
+        value = self.settings.get("initials")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:12]
+        parts = [p for p in self.author.replace(".", " ").split() if p]
+        return "".join(p[0].upper() for p in parts[:3]) or "AB"
+
+    def recent_fonts(self) -> list[str]:
+        value = self.settings.get("recent_fonts")
+        return [v for v in value if isinstance(v, str)][:6] if isinstance(value, list) else []
+
+    def add_recent_font(self, name: str) -> None:
+        fonts = [name] + [f for f in self.recent_fonts() if f != name]
+        self.settings.set("recent_fonts", fonts[:6])
