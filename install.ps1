@@ -37,7 +37,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $AppName = "PDF Desk"
-$Version = "1.1.0"
+$Version = "2.0.1"
 $Src = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Dest = Join-Path $env:LOCALAPPDATA "Programs\PDF Desk"
 $AppDir = Join-Path $Dest "app"
@@ -95,19 +95,8 @@ if (-not $Python) {
 }
 Say "Using Python at $Python"
 
-# ---- program files
-Say "Copying program files to $Dest"
+# ---- private Python environment (packages first: if this fails, the program files aren't touched)
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
-if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
-New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
-Copy-Item -Recurse -Force (Join-Path $Src "pdfdesk") $AppDir
-Copy-Item -Force (Join-Path $Src "pdfdesk.py") $AppDir
-Copy-Item -Force (Join-Path $Src "requirements.txt") $AppDir
-Copy-Item -Force (Join-Path $Src "requirements.lock") $AppDir
-Copy-Item -Force (Join-Path $Src "uninstall.ps1") $Dest
-Get-ChildItem -Path $AppDir -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
-
-# ---- private Python environment
 $VenvPy = Join-Path $Venv "Scripts\python.exe"
 $VenvPyw = Join-Path $Venv "Scripts\pythonw.exe"
 if (Test-Path $VenvPy) {
@@ -126,12 +115,31 @@ Say "Installing Python packages (first time takes a few minutes)"
 $pipArgs = @("-m", "pip", "install", "--disable-pip-version-check")
 if ($Wheels) { $pipArgs += @("--no-index", "--find-links", $Wheels) }
 if ($Unlocked) {
-    $pipArgs += @("--upgrade", "-r", (Join-Path $AppDir "requirements.txt"))
+    $pipArgs += @("--upgrade", "-r", (Join-Path $Src "requirements.txt"))
 } else {
-    $pipArgs += @("--require-hashes", "-r", (Join-Path $AppDir "requirements.lock"))
+    $pipArgs += @("--require-hashes", "-r", (Join-Path $Src "requirements.lock"))
 }
 & $VenvPy @pipArgs
 if ($LASTEXITCODE -ne 0) { throw "Installing the Python packages failed. See the messages above." }
+
+# ---- program files
+Say "Copying program files to $Dest"
+New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+# copied next to the old version first, then swapped in, so a failed copy leaves the old one working
+$AppNew = Join-Path $Dest "app.new"
+if (Test-Path $AppNew) { Remove-Item -Recurse -Force $AppNew }
+New-Item -ItemType Directory -Force -Path $AppNew | Out-Null
+Copy-Item -Recurse -Force (Join-Path $Src "pdfdesk") $AppNew
+Copy-Item -Force (Join-Path $Src "pdfdesk.py") $AppNew
+Copy-Item -Force (Join-Path $Src "requirements.txt") $AppNew
+Copy-Item -Force (Join-Path $Src "requirements.lock") $AppNew
+Get-ChildItem -Path $AppNew -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
+Rename-Item -Path $AppNew -NewName "app"
+Copy-Item -Force (Join-Path $Src "uninstall.ps1") $Dest
+
+# ---- remember how it was installed (automatic updates only install over hash-checked installs)
+Set-Content -Path (Join-Path $Dest "install-options") -Encoding ASCII -Value ("unlocked=" + ([int][bool]$Unlocked))
 
 # ---- launchers
 $Script = Join-Path $AppDir "pdfdesk.py"

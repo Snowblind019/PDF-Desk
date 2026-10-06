@@ -1,0 +1,4 @@
+# Keep line endings right whatever system the repo is checked out on
+*.sh text eol=lf
+*.py text eol=lf
+*.bat text eol=crlf

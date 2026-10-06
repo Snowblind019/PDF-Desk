@@ -1,4 +1,4 @@
-"""Paths and user settings. Everything is stored locally as JSON, nothing goes online."""
+"""Paths and user settings, stored locally as JSON."""
 from __future__ import annotations
 
 import getpass
@@ -102,6 +102,9 @@ DEFAULTS = {
     "measure_mode": "distance",
     "measure_scale": {"page_value": 1, "page_unit": "in", "real_value": 1, "real_unit": "in", "decimals": 2},
     "speech_rate": 0,
+    "check_updates": True,         # look for a new release on GitHub at start-up, at most once a day
+    "last_update_check": 0,
+    "skipped_version": "",
 }
 
 

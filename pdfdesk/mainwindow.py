@@ -39,6 +39,8 @@ class MainWindow(QMainWindow):
         self.settings = get_settings()
         self.recents = RecentFiles(int(self.settings.get("recents_limit") or 40))
         self.opt = T.ToolOptions(self.settings)
+        from pdfdesk.update_ui import UpdateController
+        self.updates = UpdateController(self)
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
         self.setAcceptDrops(True)
@@ -250,6 +252,7 @@ class MainWindow(QMainWindow):
 
         a("shortcuts", "Keyboard shortcuts", lambda: dialogs.ShortcutsDialog(self).exec(), "F1", doc=False)
         a("extras", "Optional extras (LibreOffice, OCR)", self.extras_help, None, doc=False)
+        a("check_updates", "Check for updates...", self.check_for_updates, None, doc=False)
         a("about", f"About {APP_NAME}", self.about, None, doc=False)
 
         self.act["night"].setChecked(bool(self.settings.get("night_mode")))
@@ -332,7 +335,7 @@ class MainWindow(QMainWindow):
             fm.addSeparator() if k is None else fm.addAction(self.act[k])
 
         m = mb.addMenu("&Help")
-        for k in ("shortcuts", "extras", None, "about"):
+        for k in ("shortcuts", "extras", None, "check_updates", "about"):
             m.addSeparator() if k is None else m.addAction(self.act[k])
 
     def _build_toolbars(self) -> None:
@@ -1258,6 +1261,7 @@ class MainWindow(QMainWindow):
         self.settings.data["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
         self.settings.data["window_state"] = bytes(self.saveState().toBase64()).decode()
         self.settings.save()
+        self.updates.shutdown()
         ev.accept()
 
     def _restore_window(self) -> None:
@@ -2208,6 +2212,9 @@ class MainWindow(QMainWindow):
     # ================================================================== help
     def extras_help(self) -> None:
         ui.rich_information(self, "Optional extras", dialogs.EXTRAS_HELP)
+
+    def check_for_updates(self) -> None:
+        self.updates.check_now()
 
     def about(self) -> None:
         box = QMessageBox(self)

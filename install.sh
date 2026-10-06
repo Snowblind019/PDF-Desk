@@ -86,18 +86,8 @@ if [ "$EXTRAS" = 1 ]; then
     fi
 fi
 
-# ---- copy the program
-say "Copying program files to $DEST"
+# ---- private Python environment (packages first: if this fails, the program files aren't touched)
 mkdir -p "$DEST"
-rm -rf "$DEST/app.new"
-mkdir -p "$DEST/app.new"
-cp -r "$SRC/pdfdesk" "$SRC/pdfdesk.py" "$SRC/requirements.txt" "$SRC/requirements.lock" "$DEST/app.new/"
-[ -f "$SRC/uninstall.sh" ] && cp "$SRC/uninstall.sh" "$DEST/"
-find "$DEST/app.new" -name "__pycache__" -type d -prune -exec rm -rf {} +
-rm -rf "$DEST/app"
-mv "$DEST/app.new" "$DEST/app"
-
-# ---- private Python environment
 if [ -x "$DEST/venv/bin/python" ] && \
    ! "$DEST/venv/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, $MINOR) else 1)"; then
     say "Replacing the old Python environment (it uses an older Python)"
@@ -111,10 +101,24 @@ say "Installing Python packages (first time takes a few minutes)"
 PIP=("$DEST/venv/bin/python" -m pip install --disable-pip-version-check)
 [ -n "$WHEELS" ] && PIP+=(--no-index --find-links "$WHEELS")
 if [ "$UNLOCKED" = 1 ]; then
-    "${PIP[@]}" --upgrade -r "$DEST/app/requirements.txt"
+    "${PIP[@]}" --upgrade -r "$SRC/requirements.txt"
 else
-    "${PIP[@]}" --require-hashes -r "$DEST/app/requirements.lock"
+    "${PIP[@]}" --require-hashes -r "$SRC/requirements.lock"
 fi
+
+# ---- copy the program
+say "Copying program files to $DEST"
+mkdir -p "$DEST"
+rm -rf "$DEST/app.new"
+mkdir -p "$DEST/app.new"
+cp -r "$SRC/pdfdesk" "$SRC/pdfdesk.py" "$SRC/requirements.txt" "$SRC/requirements.lock" "$DEST/app.new/"
+[ -f "$SRC/uninstall.sh" ] && cp "$SRC/uninstall.sh" "$DEST/"
+find "$DEST/app.new" -name "__pycache__" -type d -prune -exec rm -rf {} +
+rm -rf "$DEST/app"
+mv "$DEST/app.new" "$DEST/app"
+
+# ---- remember how it was installed (automatic updates only install over hash-checked installs)
+printf 'unlocked=%s\n' "$UNLOCKED" > "$DEST/install-options"
 
 # ---- launcher
 mkdir -p "$BIN"

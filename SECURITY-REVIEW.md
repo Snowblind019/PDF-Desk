@@ -1,8 +1,42 @@
 # PDF Desk security review
 
-**Latest review:** October 2026, version 1.1.0 (second round, covering everything new in 1.1). The first round covered version 1.0.0 and is kept below.
+**Latest review:** October 2026, version 2.0.1 (automatic updates). Earlier rounds covered version 1.1.0 (round 2) and 1.0.0 (round 1) and are kept below.
 
-**Result:** no malware, hidden behavior or network access was found in either round. Both rounds found real security bugs, mostly in how the app handles untrusted content inside PDFs. All of them are fixed and covered by tests.
+**Result:** no malware, hidden behavior or unexpected network access was found in any round. Every round found real bugs, mostly in how the app handles untrusted content. All of them are fixed and covered by tests.
+
+## Round 3: version 2.0.1 (automatic updates)
+
+Version 2.0.1 adds the first code in PDF Desk that goes online: a check for new releases on GitHub and an automatic update. That code (`pdfdesk/updater.py`, `update_ui.py`, `locks.py`, `tools/make_release.py` and the installer changes) was reviewed line by line, attacked with hand-made inputs, and reviewed again after each round of fixes until nothing was left that could run unsigned code.
+
+### What goes online, and when
+
+- At start-up, at most once a day (can be turned off in Edit > Preferences), and from Help > Check for updates: one HTTPS request to `api.github.com` for the latest release of `Snowblind019/PDF-Desk`. It carries no cookies or IDs, only a User-Agent with the PDF Desk version.
+- Only after the user clicks Install now: the release's `.zip` and `.zip.sig` from `github.com` (and the GitHub download hosts it redirects to).
+- The installer then runs pip with `requirements.lock` (hash-checked), which contacts PyPI only if a package changed.
+
+### How an update is trusted
+
+- **Signed releases.** The zip must be signed with the PDF Desk release key (Ed25519). The public key ships in `pdfdesk/assets/update-key.pub`; the private key stays on the maintainer's computer, encrypted with AES-256-GCM under a key made from a passphrase with scrypt. The signature covers the version and the zip's SHA-256, so an older signed release can't be passed off as a newer one. Someone who took over the GitHub account still couldn't push an update.
+- **Only HTTPS to GitHub.** Every request and every redirect must be `https` to `api.github.com`, `github.com`, `objects.githubusercontent.com` or `release-assets.githubusercontent.com` on port 443, with normal certificate checks. Download links in the release must point at this repo's release downloads. Sizes and total time are capped.
+- **Careful unpacking**, after the signature check: no absolute paths, `..`, drive letters, backslashes, links, Windows device names (CON, NUL, COM1...), names ending in a dot or space, or duplicate names; size and file count limits; the version inside must match. Files are unpacked into a private folder in the user's cache that other users can't write to.
+- **Text from GitHub** (release notes) is shown as plain text with control and text-direction characters removed.
+
+### How it installs
+
+- The update's own installer (`install.sh` / `install.ps1`) does the work, so the Python packages are still hash-checked. It installs the packages before replacing the program files, so a failed package download leaves the program as it was. Installs made with `--unlocked` (unpinned packages) never update themselves.
+- PDF Desk asks to save changes, closes, and a small helper takes over. Every running PDF Desk holds an operating-system lock, and the helper waits until every one of them has closed, then holds an update lock so no PDF Desk can start until the install is done. If a window stays open, nothing is installed and PDF Desk says so. The helper runs the system Python in isolated mode (`-I`), calls bash and PowerShell by full path, and never uses a shell.
+
+### Fixed during this round
+
+- Closing PDF Desk while a check or download was running could crash it. Network work now runs on plain background threads.
+- A second update prompt could start a second download that broke the first. Only one check, prompt or download happens at a time.
+- Cancel was ignored once the download had finished, and closing the progress window counted as Cancel, which stopped Install now from working at all. Both fixed and covered by a test that goes from Install now to the installer.
+- Other PDF Desk windows (started with "new window") weren't waited for, and a crashed copy's leftover file could block updates for good. Replaced by operating-system locks.
+- The release script could have packaged stray files: it now packages a fixed list of folders, requires a clean git checkout, refuses anything that looks like a key, and keeps the key outside the repo.
+
+### Tests
+
+`tests/test_updater.py` covers versions, release info from GitHub, the host checks, signatures (changed zip, wrong key, older release with a newer version number), unpacking attacks, the locks, the once-a-day logic, the release script from key creation to a verified zip, and the prompts in the real window. The whole suite has 101 tests. A full update was also run end to end on Linux: installed 2.0.1 with `install.sh`, published a signed 2.0.2, and let PDF Desk update itself while a second window was open.
 
 ## Round 2: version 1.1.0
 
@@ -157,7 +191,7 @@ No GitHub repositories or other code are downloaded or referenced by the program
 
 ```bash
 cd "PDF Desk"
-python3 -m pytest -q tests                      # 87 tests, including the hostile-input and signature attack ones
+python3 -m pytest -q tests                      # 101 tests, including the hostile-input, signature attack and update ones
 pip install bandit pip-audit
 bandit -r pdfdesk                               # static security scan
 pip-audit -r requirements.lock                  # known vulnerabilities in the pinned packages

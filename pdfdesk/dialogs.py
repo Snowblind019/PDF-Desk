@@ -1135,6 +1135,11 @@ class SettingsDialog(QDialog):
         self.limit.setRange(5, 200)
         self.limit.setValue(int(settings.get("recents_limit") or 40))
         f.addRow("Recent files to keep:", self.limit)
+        self.updates = QCheckBox("Check for updates when PDF Desk starts (once a day)")
+        self.updates.setChecked(bool(settings.get("check_updates")))
+        self.updates.setToolTip("Asks GitHub whether there's a newer PDF Desk. Nothing about you or your files "
+                                "is sent. Help > Check for updates always works.")
+        f.addRow("", self.updates)
         tabs.addTab(gen, "General")
 
         ext = QWidget()
@@ -1166,6 +1171,7 @@ class SettingsDialog(QDialog):
         s.set("highlight_forms", self.forms.isChecked())
         s.set("author", self.author.text().strip())
         s.set("recents_limit", self.limit.value())
+        s.set("check_updates", self.updates.isChecked())
         s.set("libreoffice_path", self.lo.path())
         s.set("tessdata_path", self.tess.path())
 

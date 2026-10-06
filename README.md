@@ -2,11 +2,13 @@
 
 PDF Desk is a PDF viewer, editor and converter for Linux and Windows. It covers the everyday things Adobe Acrobat is used for: reading, highlighting and commenting, text boxes with any font on your computer, filling and creating forms, signing (by hand or with a Digital ID), editing text, moving pages around, redacting, comparing files, measuring, compressing, password protecting, OCR, reading out loud, and turning other files into PDFs or PDFs into other files.
 
-Everything runs on your own computer. PDF Desk never connects to the internet, so it works the same with no Wi-Fi. The only time a link opens your browser is when you click a web link inside a PDF, and it asks first. See [Security](#security) for details.
+Everything runs on your own computer and works the same with no Wi-Fi. The only thing PDF Desk does online is check GitHub for a new version, once a day at most, and you can turn that off in Preferences. Updates only install when you say yes, and only if they're signed with the PDF Desk release key. The only time a link opens your browser is when you click a web link inside a PDF, and it asks first. See [Security](#security) for details.
+
+**New in 2.0.1:** automatic updates. See [Updates](#updates).
 
 **New in 1.1:** Word-style text formatting with a font list, Prepare Form, Fill & Sign, Digital IDs and certificate signatures, Read Out Loud, Compare files, Presentation mode, Reader view, measuring, links, attachments, layers, page labels, backgrounds, N-up and booklet printing, Bates numbering and more. See [What's new in 1.1](#whats-new-in-11).
 
-https://github.com/user-attachments/assets/ba872852-0601-4f70-aeb6-915b4bc97476
+![Home screen with recent files](docs/screenshots/home.png)
 
 ## Features
 
@@ -123,7 +125,7 @@ cd "PDF Desk"
 ./install.sh
 ```
 
-That installs PDF Desk for your user only (no sudo), adds it to your app menu and to the "Open with" list for PDF files, and adds a `pdfdesk` command. The first install downloads the Python packages it needs, after that no internet is used.
+That installs PDF Desk for your user only (no sudo), adds it to your app menu and to the "Open with" list for PDF files, and adds a `pdfdesk` command. The first install downloads the Python packages it needs. After that the only internet use is the daily update check (see [Updates](#updates)).
 
 Options:
 
@@ -238,13 +240,36 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Wheels wheels  # Windows
 | Create PDF from clipboard | Ctrl+Shift+V |
 | All shortcuts | F1 |
 
+## Updates
+
+PDF Desk checks the [GitHub releases](https://github.com/Snowblind019/PDF-Desk/releases) for a newer version when it starts, at most once a day. If there is one, it asks whether to install it. Click **Install now** and PDF Desk downloads the update, checks it, closes (asking you to save any changes first), installs it and opens again. **Not now** asks again next time, and **Skip this version** stops asking until an even newer one comes out.
+
+- **Help > Check for updates** checks right away.
+- To stop the daily check, untick "Check for updates when PDF Desk starts" in Edit > Preferences. Nothing goes online after that unless you use Help > Check for updates.
+- The check sends nothing about you or your files: it's a single request to GitHub that only includes the PDF Desk version number. Installing an update also lets pip fetch any changed Python packages from PyPI.
+- An update installs only if it's signed with the PDF Desk release key, whose public half ships with PDF Desk (`pdfdesk/assets/update-key.pub`). A download that isn't signed by that key, or that was changed on the way, is refused and nothing is changed. Even someone who took over the GitHub account couldn't push an update without the key.
+- If more than one PDF Desk window is open, close the others first. The update waits until every window has closed, and PDF Desk can't be started while it installs.
+- Automatic updates work for copies installed with `install.sh` or `install.bat`. They run that same installer, so the Python packages still come from `requirements.lock` and are hash-checked. Standalone builds, copies run straight from the source folder and copies installed with `--unlocked` get a link to the download page instead.
+
+### Publishing a release (for the maintainer)
+
+Once, on your own computer: `python3 tools/make_release.py init`. This creates the release key, saves the private half outside the repo (`~/.config/pdf-desk-release/` on Linux, `%APPDATA%\pdf-desk-release\` on Windows) locked with a passphrase you choose, and writes the public half to `pdfdesk/assets/update-key.pub`. Commit that file. Back up the private key and its passphrase: without them you can't sign updates, and installed copies would need to be updated by hand.
+
+For each release:
+
+1. Change `__version__` in `pdfdesk/__init__.py` (and the version in `install.ps1` and `installer.iss`), commit and push.
+2. Run `python3 tools/make_release.py build`. It makes `dist/PDF-Desk-<version>.zip` and `dist/PDF-Desk-<version>.zip.sig` and checks them.
+3. Create a GitHub release tagged `v<version>` and attach both files, for example `gh release create v2.0.2 dist/PDF-Desk-2.0.2.zip dist/PDF-Desk-2.0.2.zip.sig --title "PDF Desk 2.0.2"`. The release notes are shown in the update prompt.
+
+The script needs the `cryptography` package; PDF Desk's own Python has it (`~/.local/share/pdf-desk/venv/bin/python tools/make_release.py build`).
+
 ## Where things are stored
 
 | | Linux | Windows |
 |---|---|---|
 | Settings, recent files list, signatures | `~/.config/pdfdesk/` | `%APPDATA%\PDF Desk\` |
 | Digital IDs and trusted certificates | `~/.config/pdfdesk/digital-ids/` and `trusted-certificates/` | `%APPDATA%\PDF Desk\digital-ids\` and `trusted-certificates\` |
-| Thumbnails, font list and temporary files | `~/.cache/pdfdesk/` | `%LOCALAPPDATA%\PDF Desk\cache\` |
+| Thumbnails, font list, temporary files and downloaded updates | `~/.cache/pdfdesk/` | `%LOCALAPPDATA%\PDF Desk\cache\` |
 | Program | `~/.local/share/pdf-desk/` | `%LOCALAPPDATA%\Programs\PDF Desk\` |
 
 Handwritten signatures are saved as PNG files in the `signatures` folder and never leave your computer. Digital IDs are kept in a folder only your account can open, each locked with its own password (at least 8 characters, protected with AES-256 and 600,000 rounds of password hashing). Back up the `digital-ids` folder if you want to keep your IDs: without the file and its password nobody, including you, can sign with that ID again.
@@ -275,13 +300,16 @@ Handwritten signatures are saved as PNG files in the `signatures` folder and nev
 | `pdfdesk/pdfops.py` | Page tools, split, watermark, headers, compression, passwords, OCR, redaction |
 | `pdfdesk/convert.py` | Importing to PDF and exporting to other formats |
 | `pdfdesk/dialogs.py`, `signature.py` | Dialog windows and the signature manager |
+| `pdfdesk/updater.py`, `update_ui.py` | Update checks, signed downloads and installing updates |
+| `tools/make_release.py` | Makes and signs a release (maintainer only, not installed) |
+| `pdfdesk/locks.py` | Knowing which PDF Desk windows are open, so updates wait for them |
 | `tests/` | Automated tests (`python -m pytest -q tests`), including a full headless GUI run |
 
 ## Security
 
 PDF Desk was checked line by line for anything harmful and for security bugs (see `SECURITY-REVIEW.md`). In short:
 
-- **No network access.** The program has no code that talks to the internet. The only outside programs it runs are LibreOffice (for Office conversions), Tesseract (only to list OCR languages) and the system speech engine for Read Out Loud (espeak-ng on Linux, Windows' own voices through PowerShell), always with fixed arguments and never through a shell. The text to read is passed on standard input, never on a command line.
+- **The only network use is the update check and installing updates.** It talks to GitHub over HTTPS only, follows no redirects to other sites, sends nothing but the PDF Desk version, can be turned off in Preferences, and installs nothing that isn't signed with the PDF Desk release key (see [Updates](#updates)). Nothing else in PDF Desk talks to the internet. The only outside programs it runs are LibreOffice (for Office conversions), Tesseract (only to list OCR languages) and the system speech engine for Read Out Loud (espeak-ng on Linux, Windows' own voices through PowerShell), always with fixed arguments and never through a shell. The text to read is passed on standard input, never on a command line.
 - **Digital signatures are checked offline.** Signing never contacts a time-stamp server, and checking never downloads certificates or revocation lists. pyHanko's network code is installed with it but is switched off in PDF Desk. You decide which certificates you trust, and a personal certificate you trust can't vouch for anyone else.
 - **Changes after signing are checked, not just the signature.** A signed PDF can carry later updates. PDF Desk compares the signed version with the current one and marks the signature as not valid when page content, form fields or document actions were changed, so a file can't keep a valid signature while showing something else.
 - **Links inside PDFs are treated as untrusted.** Web links only open after you confirm, and only `http`, `https` and `mailto` links are allowed. Links to other files only open other local PDFs, after you confirm. Links to network shares (`\\server\share`, mapped network drives), `file://` addresses, unusual Windows device paths and "launch" actions are blocked. Before you confirm a web link, PDF Desk shows the real site name, and warns when it uses look-alike letters. PDF JavaScript never runs.

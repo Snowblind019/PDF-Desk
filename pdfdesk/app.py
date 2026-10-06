@@ -268,6 +268,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if not new_window and _send_to_running(files):
         return 0
+    from pdfdesk import updater
+    try:
+        free = updater.register_process()  # so an update waits until every PDF Desk window is closed
+    except Exception as exc:  # noqa: BLE001 - never stop PDF Desk from starting over this
+        print(f"Couldn't register for safe updates: {exc}", file=sys.stderr)
+        free = True
+    if not free:
+        from pdfdesk import ui
+        ui.information(None, APP_NAME, f"{APP_NAME} is being updated. It opens by itself when the update is "
+                       "done, usually within a minute.")
+        return 0
 
     from pdfdesk import icons, theme
     from pdfdesk.config import settings
@@ -287,9 +298,12 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     window.show()
+    from PySide6.QtCore import QTimer
     if files:
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(0, lambda: window.open_paths(files))
+    from pdfdesk import update_ui
+    QTimer.singleShot(500, lambda: update_ui.report_last_update(window))
+    QTimer.singleShot(4000, window.updates.check_in_background)  # once a day at most, see Preferences
     return app.exec()
 
 
