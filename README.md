@@ -8,7 +8,7 @@ Everything runs on your own computer and works the same with no Wi-Fi. The only 
 
 **New in 1.1:** Word-style text formatting with a font list, Prepare Form, Fill & Sign, Digital IDs and certificate signatures, Read Out Loud, Compare files, Presentation mode, Reader view, measuring, links, attachments, layers, page labels, backgrounds, N-up and booklet printing, Bates numbering and more. See [What's new in 1.1](#whats-new-in-11).
 
-![Home screen with recent files](docs/screenshots/home.png)
+https://github.com/user-attachments/assets/2eeaf828-e834-4637-a254-619b647deed2
 
 ## Features
 
