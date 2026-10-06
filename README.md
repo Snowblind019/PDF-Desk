@@ -6,7 +6,7 @@ Everything runs on your own computer. PDF Desk never connects to the internet, s
 
 **New in 1.1:** Word-style text formatting with a font list, Prepare Form, Fill & Sign, Digital IDs and certificate signatures, Read Out Loud, Compare files, Presentation mode, Reader view, measuring, links, attachments, layers, page labels, backgrounds, N-up and booklet printing, Bates numbering and more. See [What's new in 1.1](#whats-new-in-11).
 
-![Home screen with recent files](docs/screenshots/home.png)
+https://github.com/user-attachments/assets/ba872852-0601-4f70-aeb6-915b4bc97476
 
 ## Features
 
